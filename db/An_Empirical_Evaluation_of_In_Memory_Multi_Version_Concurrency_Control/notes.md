@@ -41,3 +41,7 @@ OCC （MVOCC）
 在这里，因为我们内嵌了锁，所以如果要进行DL_DETECT的话需要额外的数据结构。因此我们使用死锁预防，比如no-wait，或者wait-die
 
 个人的理解，MV2PL还是有等待的，所以MV的添加其实是缓解了2PL的冲突。原本所有的txn都要等待一个tuple，现在有了多个版本，冲突也就相应的减少了。
+
+对于MVCC的read uncommitted，我们可以跟踪每个txn所读到的uncommitted data，并且只有读到的data全都commit以后才能提交当前事务
+
+我们也可以让txn去更新一个被uncommitted txn读过的数据项。但是同样我们需要维护他们的依赖关系，并等所有依赖的txn提交之后，当前的txn才能提交
