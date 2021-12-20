@@ -1,6 +1,0 @@
-make --dry-run --always-make --keep-going --print-directory
-make: Entering directory '/home/sheep/paper_notes/db/An_Empirical_Evaluation_of_In_Memory_Multi_Version_Concurrency_Control'
-make: Leaving directory '/home/sheep/paper_notes/db/An_Empirical_Evaluation_of_In_Memory_Multi_Version_Concurrency_Control'
- 
-make: *** No targets specified and no makefile found.  Stop.
- 
