@@ -81,3 +81,40 @@ However, hot spots did develop when GFS was first used by a batch-queue system: 
 
 通过增加replication factor来分散读取压力，然后错开batch-queue system启动这个application的时间。更好的解决方法是允许client read from other client（P2P？）
 
+2.6 metadata
+
+metadata存储namespaces，file to chunk的映射以及每个replicas的位置
+
+metadata都存储在master的memory中
+
+对于namespaces和mapping通过`operation log`来记录他们的变化到disk中，并且复制到remote machines，从而保证他们的持久性
+
+master不会存储chunk replicas的位置，而是当master启动的时候或者chunkserver加入cluster的时候去询问chunkserver他存储有关chunk的信息
+
+将metadata存到master的memory中有两个好处，一是加速了master operation，二是方便master在后台周期性的去扫描master的状态，从而用来实现chunk的GC，re-replication（当chunkserver fail的时候），以及chunk migration（用于负载均衡）
+
+master通过HeartBeat messages来监测chunkserver的状态，并且控制着chunk的placement。通过让master去监测chunkserver，而不是让master去存储chunk的位置信息，我们可以不用考虑有关chunkserver和master信息的同步
+
+论文中有提到，要认识到是chunkserver对其拥有那些块有最终话语权，而不是master。所以尝试在master上去维护一个对chunk location的consistent view是没意义的
+
+`operation log`记录了对GFS中的metadata的改变历史。他不仅是对metadata的一个persistent record，同时还定义了并发operation的顺序
+
+对于用户的操作，我们会把对应的operation log存储到本地和远端来防止master失效。master会batch这些log的flush和replication操作，从而提高整体的系统吞吐量（和log based的file system一样）
+
+同样，为了防止log的数量过多导致的重启时间过长，master在log超过一定数量的时候就会进行checkpoint
+
+论文中提到checkpoint是一种B-tree的形式，可以直接映射到内存中，从而加速恢复。这里还不太清楚，看后面会不会细说一下
+
+和fs一样，checkpoint不会阻塞后续的operation。当checkpoint的时候，master会切换到新的log file并且在新的thread中创建checkpoint（个人猜测应该会shadow一些页来保证操作的原子性，或者保证operation的幂等性）
+
+2.7 consistency model
+
+file namespace的修改是atomic的
+
+A file region is consistent if all clients will always see the same data, regardless of which replicas they read from. 
+A region is defined after a file data mutation if it is consistent and clients will see what the mutation writes in its entirety
+When a mutation succeeds without interference from concurrent writers, the affected region is defined (and by implication consistent): all clients will always see what the mutation has written
+
+当并发的同时写一个文件的时候，就有可能导致数据出现混合的情况，但是所有的writer都看到的是相同的数据。所以这是consistent，但是非defined的，因为我们不确定到底能看到是什么
+
+GFS通过（a）在所有的replicas上以相同的顺序应用mutation，（b）使用version number检测stale的replica，来保证file是defined
