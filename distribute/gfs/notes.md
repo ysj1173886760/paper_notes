@@ -118,3 +118,7 @@ When a mutation succeeds without interference from concurrent writers, the affec
 当并发的同时写一个文件的时候，就有可能导致数据出现混合的情况，但是所有的writer都看到的是相同的数据。所以这是consistent，但是非defined的，因为我们不确定到底能看到是什么
 
 GFS通过（a）在所有的replicas上以相同的顺序应用mutation，（b）使用version number检测stale的replica，来保证file是defined
+
+在append的时候，如果当前chunk的空间不够了，GFS会选择在新的chunk上进行append，并返回对应的offset，而对于中间的一部分无效数据，GFS会插入padding或者重复的records
+
+在写入的时候，每一个record都包含着额外的信息，比如校验和。在读取的时候，我们可以通过校验和来识别并丢弃这些padding和重复的records
