@@ -122,3 +122,79 @@ GFS通过（a）在所有的replicas上以相同的顺序应用mutation，（b�
 在append的时候，如果当前chunk的空间不够了，GFS会选择在新的chunk上进行append，并返回对应的offset，而对于中间的一部分无效数据，GFS会插入padding或者重复的records
 
 在写入的时候，每一个record都包含着额外的信息，比如校验和。在读取的时候，我们可以通过校验和来识别并丢弃这些padding和重复的records
+
+![20220205202903](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220205202903.png)
+
+3.1 Leases and Mutation Order
+
+master将租约授权给某一个replica，称之为primary，然后primary来为所有的变更选择一个序列化的顺序，其他所有的replicas都根据primary选择的顺序进行变更
+
+所以全局的变更顺序首先由master授权的租约顺序决定，然后再由primary指定的变更顺序决定
+
+租约有一个初始的60秒的超时时间。只要有数据mutation，primary就可以无限的从master那里请求延长租约。请求和授权的操作是在HeartBeat message上进行的
+
+![20220206142546](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220206142546.png)
+
+1. client首先问master那个chunkserver是primary，以及其他副本的位置
+2. master回复primary以及其他副本的位置。client缓存这些信息
+3. client将数据发送给所有的副本。（而不是发给primary，再让primary发给别人）通过decouple数据和控制flow，我们可以根据网络拓扑结构来schedule数据流，从而提高性能
+4. 一旦所有副本都确认收到数据，client就会向primary发送写请求。primary将连续的序列号分配给他收到的mutation operation，并按照序列号顺序应用这些operation，从而保证序列化
+5. primary将这个请求转发给所有的从副本，从副本也按照序列号来应用operation
+6. 所有的从副本回复primary表示操作完成
+7. primary回复给client，如果出现了错误，则写入可能在主副本和部分从副本写入成功，则client认为写入失败，并且修改的区域处于inconsistent的状态。client会先重试几次3到7步，然后再回到开始进行重试（个人认为这块是防止primary过期或者其他问题，从而让master选择一个新的primary来领导修改）
+
+3.2 data flow
+
+control flow从client到primary，再到所有的replica
+
+data flow则是以流水线的方式沿着特殊的（原文是carefully picked）chunkserver chain进行流动，从而最大化利用率
+
+发送数据时，每一个机器都选择离自己最近的没有接受到数据的机器进行转发。只要一开始接受数据，就开始转发，从而减少延迟
+
+论文中提到network topology is simple enough that distances can be accurately estimated from IP address
+
+3.3 atomic record appends
+
+append和上面的流程相同，但是有一点额外的逻辑处理。primary检查如果record append会导致当前chunk超过max size，那么他就会进行填充，然后叫所有的从副本也进行填充。并返回给client让他在下一个chunk上重试。
+
+每次record append的最大限制是max size的四分之一，这样可以保证我们的无效数据在一个可接受的范围内
+
+GFS不能保证所有的副本都是完全相同的，他只能保证数据会被原子的写入至少一次。所以为了让我们的append operation成功，数据必须是以相同的offset写入所有副本的，同时所有副本的长度也至少和添加后的record末尾相同。从而保证后续的append操作的offset会被分配到更高的offset或者不同的数据块
+
+3.4 snapshot
+
+通过COW来实现snapshot
+
+当master接收到snapshot的操作的时候，他会首先回收有关chunk的租约，从而防止相关chunk的更改
+
+然后他会log这次operation，并且将相关文件的metadata进行复制，所以新创建的文件也会指向相同的chunk
+
+当client想要写chunk C的时候，master会发现chunk C的reference count是大于1的。然后master会找一个新的chunk handle C1。接着master会让所有拥有chunk C的server去创建一个新的chunk C1。GFS保证让data是在本地进行copy的，从而防止跨越网络的复制
+
+之后master正常回复client，就和正常的写操作一样了
+
+4.1 namespace management and locking
+
+和传统的文件系统不同， GFS没有列出该目录所有文件的数据结构。GFS在逻辑上将其namespace表示为一个lookup table，他将完整的路径名映射到metadata。
+
+加锁的方式就是从根目录向下加锁，从而保证操作的串行化
+
+比如创建文件/home/user/foo，GFS会在/home和/home/user上获取读锁，并且在/home/user/foo上获取写锁。因为我们不需要修改parent directory的数据，所以不需要在父目录上获取写锁。在创建的文件上获取写锁可以防止同时创建相同名字的文件。（所以感觉lock更像是对一个字符串进行lock，因为这里没有实质的目录对象？）
+
+为了防止死锁，获取锁的顺序要根据namespace tree上的level排序，同level下，用字典序排序
+
+4.2 replica placement
+
+GFS的节点具有多个级别，机器之间的communication可能跨越多个机架
+
+我们要最大化数据的可用性，以及网络利用率。只在同一个机架上放置replica是不够的，因为可能出现交换机或者电源上面的问题，导致整个机架脱机。所以我们也需要跨机架放置副本
+
+并且读取的情况下，我们可以利用多个机架的总带宽。但是同样的，写入也需要跨越多个机架。减缓了写的速度，但是提高了读取速度以及数据的可用性
+
+4.3 creation re-replication, rebalancing
+
+当master创建新的chunk时，他要考虑几点来选择放置chunk的位置
+
+1. 我们希望选择一个磁盘空间利用率低于平均水平的server
+2. 我们希望限制每个server最近创建chunk的数量，因为chunk的创建代表着后续会进行写操作
+3. 同时我们还希望在机架上分布这些副本
