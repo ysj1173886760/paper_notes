@@ -198,3 +198,49 @@ GFS的节点具有多个级别，机器之间的communication可能跨越多个�
 1. 我们希望选择一个磁盘空间利用率低于平均水平的server
 2. 我们希望限制每个server最近创建chunk的数量，因为chunk的创建代表着后续会进行写操作
 3. 同时我们还希望在机架上分布这些副本
+
+当副本的数量低于指定的目标的时候，GFS就会去重新复制这个块。每个需要重新复制的chunk都会根据一些因素来进行排序。比如缺失了两个副本的块会优先于缺失了一个副本的块。
+
+master会选择优先级最高的块去复制他。新的副本放置的位置的选择和上面创建新chunk的要求是相似的。同时每个chunkserver会限制他用来进行复制操作的带宽（为了不阻碍用户的读取）
+
+master会定期的对副本进行rebalances，他会检查副本的分布，以load balance和better disck space为目的移动副本。通过这个操作，master可以逐渐的fill一个新的chunkserver，而不是将很多新chunk放进去从而引发heavy write traffic。同时，master也要选择已有的副本去清除，为了平均free-space，他会优先选择free disk space低于平均水平的chunkserver
+
+4.4 GC
+
+当删除一个文件时，master会log这个操作，然后将文件重命名为隐藏的文件名
+
+master定期扫描文件系统的时候，如果发现隐藏文件已经存在了三天以上，他就会删除他们。
+
+master还会在扫描的时候识别出孤儿chunk，并删除这些chunk的metadata
+
+在master和chunkserver的HeartBeat message中，chunkserver会汇报他有那些chunk，然后master会找到那些在metadata中不存在的chunk并回复给chunkserver，chunkserver就可以去删除这些chunk
+
+这种垃圾回收的办法比起即时删除有几个优点。比如副本删除的消息可能会丢失，创建chunk失败的时候可能创建了master不知道的副本。
+
+上面的方法提供了一种可靠的方法来清理无用的副本。并且他将垃圾回收合并到了master的后台活动中。他是分批进行的，所以成本是均摊的。master可以更迅速的回复client的请求。最后延迟回收可以防止出现意外，为不可逆转的删除提供了安全网
+
+主要的缺点就是延迟删除可能会方案用户在存储空间紧张的时候对使用空间进行微调
+
+4.5 stale replica detection
+
+副本有可能变得过时。master为每个chunk维护了一个chunk version number来区分最新的和过时的副本
+
+当master授权给一个chunk租约的时候，他会增加他的chunk version number并通知其他的副本（而不是每次写都增加版本号，因为如果有从副本失效的话，新的写入操作会失败）
+
+master会通过GC来回收过时的副本
+
+还有一种保护机制是当master通知客户端那个是primary时，或者在复制副本操作的时候，master会包含chunk的版本号。这样在客户端执行操作的时候，或者chunkserver从另一个chunkserver读取chunk的时候就可以验证这个版本号来保证访问的是最新的数据
+
+5 fault tolerance and diagnosis
+
+master有自己的副本，同时我们还有只读的shadow master用来保证可用性
+
+由于GFS不能保证每个副本都是完全相同的，所以每个副本必须通过checksum独立的去验证数据的完整性
+
+一个chunk会被拆分成64KB的blocks，每个block都有32位的checksum，checksum与用户数据分开存储
+
+读取数据的时候，我们要验证与读取范围重叠的数据快的完整性。所以data corruption不会传播到其他的机器上
+
+优化计算校验和，在append的时候增量的计算校验和
+
+空闲的时候，chunkserver可以扫描和验证inactive chunks。这可以让我们检测到一些很少读到的数据中的损坏
