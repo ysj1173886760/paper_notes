@@ -109,3 +109,22 @@ MapReduce保证在给定的分区中，KV pair是按顺序处理的。所以我�
 每一个worker都有signal handler用来捕捉错误。MapReduce库会将一个序列号存储到全局变量中，如果user code出现错误，signal handler会给master发送一个包含这个序列号的信息。如果master发现在某个record上出现多次错误，他就会指示在下次re-execution的时候跳过这个记录
 
 counter，MapReduce提供了一个counter object，可以放到user code中用来计数。worker会定期的将counter的值发送给master（放在ping的回复中），master聚合这些值并当MapReduce结束的时候返回给用户。这些值也会显示在MapReduce的主状态页上，用来查看实时计算的进度。
+
+6 experience
+
+MapReduce的实现依赖于负责分发并运行用户task的集群管理系统
+
+MapReduce通过受限制的编程模型来把问题划分为大量细粒度的任务，从而让我们可以进行动态调度，以便让更快的worker处理更多的任务。同时还允许我们在接近结束的时候去执行那些比较慢的任务，从而加速执行时间
+
+MapReduce通过自动并行execution以及提供透明的容错机制来提高开发效率
+
+8 conclusion
+
+1. MapReduce模型容易使用，隐藏了并行化，容错机制，局部性优化以及负载均衡的细节
+2. 大量的问题都可以通过MapReduce来表达
+
+Learned
+
+1. 通过限制编程模型可以让并行和分布计计算，以及容错变得更简单
+2. 网络带宽是缺乏的资源，大量的优化都是为了减少网络带宽
+3. 通过redundant execution来减少较慢的机器带来的效应（木桶效应），同时进行容错
