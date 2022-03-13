@@ -57,3 +57,25 @@ GraphX和Gemini则是通过最小化启发函数得到的静态分区方法，�
 动态分区方法利用了图计算中迭代的特性。他们通过测量前一次iteration的performance来进行workload rebanlance
 
 这种方法对于GNN training会收敛到一个平衡的工作负载，但是对于GNN inference来说就不太行，因为inference对于每一个新的graph只计算一次
+
+# Roc overview
+
+![20220313202033](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220313202033.png)
+
+输入GNN architecture和图，通过partitioner划分子图
+
+然后每个节点内部有一个DPMM（dynamic-programming-based memory manager）用来减少在CPU和GPU之间的data transfer
+
+graph partitioner是和GNN一起训练的，并且也可以在新图的inference时候用来partition
+
+partition以后，每个子图都发给对应的节点。使用更大的DRAM来保存全部的数据，并将GPU memory看做cache。但是在GPU和DRAM之间传输tensor还是对runtime performance有很大影响。所以Roc用DP来最小化data transfer
+
+![20220313212317](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220313212317.png)
+
+gather就是neighborhood aggregation，后面的就是正常的DNN
+
+For each state S, we define its active tensors A(S) to be the set of tensors that were produced by the operations in S and will be consumed as inputs by the operations outside of S. Intuitively, A(S) captures all the tensors we can cache in the GPU to eliminatefuture data transfers at the stage S.
+
+![20220313221138](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220313221138.png)
+
+用dp来求最优传输
