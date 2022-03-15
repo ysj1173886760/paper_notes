@@ -144,3 +144,94 @@ Linux上的LVM可以用于创建整个磁盘分区的快照。
 * 对于磁盘块上的内容，用COW保存一致性快照并传输给follower
 * 最后重传那些在上次传输后修改过的磁盘块
 
+## LSM Tree
+
+![20220315153227](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220315153227.png)
+
+LSM Tree做状态机的算法
+
+某些系统会为每个run创造一个bloom filter。从而加速键的查找
+
+在Raft中使用LSM是相当容易的。每次apply新的log就把它放到内存的树结构中
+
+我们用raft日志大小作为限制来做合并。当raft日志到达一个阈值的时候，我们就可以把当前的状态机序列化为一个Run，然后把log都清理掉。
+
+发送给follower的时候，只需要发送所有的Run即可。内存中的树不需要，因为他们的信息存储在log中。并且因为Run是不可变的，所以我们可以很方便的传输Run（但是run还是会合并，所以我们应该也需要一个一致性的快照）
+
+最后就是一个log compaction的总结
+
+* 每个服务器都独立的压缩其log
+* 状态机和Raft之间的基本交互涉及到把log compaction的责任从raft转移到状态机中。一旦状态机将command持久化了以后，他就要通知raft去discard对应的log
+* 一旦raftdiscard了log，那么状态机就需要负责两个新的任务：重启时加载快照，并提供一个一致性的快照用来发送给其他慢的follower
+
+# Client
+
+![20220315161540](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220315161540.png)
+
+可以通过这几个RPC看到，主要是我们需要防止重复
+
+clientID用来标识用户ID，然后对于每个用户跟踪sequenceNum
+
+对于查询来说就不需要去重了，直接查就可以。但是由于读操作没有用log，所以我们需要保证这个leader是真的leader，也就是需要与majority交换一次心跳
+
+* 领导者：服务器可能处于领导者状态，但是如果它不是当前领导者，则可能不必要地延迟了客户端请求。例如，假设一个领导者已和集群的其余部分进行了分区，但是它仍然可以与特定的客户端进行通信。如果没有其他机制，它可能会永远延迟来自该客户端的请求，无法将日志条目复制到任何其他服务器。期间可能还有另一个新任期的领导者能够与大多数集群成员通信，并且能够提交客户的请求。因此，如果没有在其大部分集群中成功进行一轮心跳，选举超时就结束了，Raft 领导者就会下台。这样，客户端可以通过另一台服务器重试其请求。
+* 跟随者：跟随者保持跟踪领导者的身份，以便他们可以重定向或代理客户端的请求。他们在开始新的选举或更改任期时必须放弃此信息。否则，它们可能不必要地延迟客户端（例如，两台服务器可能会彼此重定向，从而使客户端陷入无限循环）。
+* 客户端：如果客户端失去与领导者（或任何特定服务器）的连接，则应仅简单随机重试一个服务器。如果该服务器发生故障，则坚持联系最后一位已知的领导者将导致不必要的延迟。
+
+最主要的就是不要让过期的leader一直认为自己是leader，所以我们需要用lease机制，让leader与majority交换心跳
+
+为了提供exactly-once语义，我们就需要去重的操作
+
+去重的操作还可以更加普遍一些。我们不去跟踪每个client最后的sequence number，而是去跟踪一个sequenceNumber和回复的集合
+
+每次request，client把他没收到回复的最小的sequenceNumber附带上。那么状态机就可以把更小的那些sequence和reply删除掉
+
+但是client与server之间的会话不能永久的保存下去。server必须在某一时刻删除掉这个session。那么带来了两个问题：服务器之间怎么达到删除session的共识呢？以及怎么处理session被过早关闭的情况？
+
+比如我们有一个server关闭了这个session，然后就会重新apply这个client的操作，但是另一个server没有关闭，所以他成功去重了。这时候服务器的state就是不一致的。
+
+所以我们需要找到一个确定性的方法来关闭client的session
+
+一个选项就是用LRU，设置session的上限。然后用LRU做evicit
+
+另一个选项是leader会将他的时间加入到log中，其他的follower都会根据这个时间来去expire不活跃的session。client通过发送keep-alive RPC来让leader提交一个log，从而防止他们的session被断掉
+
+另一个问题则是如何区分client是新的还是我们曾经关闭了session的client。因为如果我们为每一个没有session的client都新分配一个session的话，就有可能导致duplicate execution。所以有了上面的RegisterClient RPC，来注册一个clientID，后续的操作都会使用这个clientID。当我们发现一个clientID对应的session已经被销毁了，我们就会返回一个error（可以让client重新分配ID或者crash）
+
+## 优化读
+
+我们可以绕过日志来达成线性化的读。这个在上面的图片中有描述了具体过程
+
+核心思路就是对于一个读请求，我们需要让leader去与majority交换心跳，从而确定自己是一个最新的leader。这样读就可以直接进行
+
+注意在leader当选的时候，他不清楚当前的commitIndex到哪里了。我们可以保证leader有最新的commitindex对应的log，但是leader不能确定他目前是在那个位置。所以通过让leader提交一个空的log。当这个空的log提交的时候，leader就可以确定当前的commitindex在哪里。换一个思路理解就是由于read不走log，但是我们又需要让read是最新的数据，所以要保证那些提交了的log已经被apply了。但是切换leader的时候可能follower还没及时apply。所以这里提交空log的目的就是相当于一次同步，让leader的状态机达到最新的状态。
+
+我们还可以进一步优化一下，通过一轮心跳来确认积累的任意个读请求
+
+follower也可以进行优化，他可以去询问leader当前的readIndex。然后leader可以发送readIndex。这样当follower的状态机apply到readIndex的时候，他就可以处理读请求。
+
+注意这里不需要考虑往返RPC之间可能出现的其他写操作。因为在我们收到leader的readIndex这一刻其实相当于我们进行了读操作，在这之前出现的写操作在client的角度看是发生在这个读之前的，在这个之后的写则是在读之后的。我们仍然可以满足线性化语义。因为那些操作都是并发的，可以被划分到读之前或之后。
+
+利用租约来减少信息传输
+
+一旦集群的majority已经认可了leader的心跳，leader将假定在选举超时期间没有其他的服务器成为leader。这样leader将在此期间直接回复只读查询而无需任何其他通信
+
+我们还可以提供单调读。服务器可以将与状态机对应的索引返回给客户端，然后客户端每次请求时将这些信息提供给服务器。如果服务器发现客户端的索引大于他自己应用到的索引，他就不会为这次请求提供服务。
+
+# Optimization
+
+![20220315192518](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220315192518.png)
+
+用pipeline来并发执行RPC和disk write
+
+我们可以让follower在利用网络资源接收RPC的同时，用disk资源来进行写入
+
+为了使用pipeline，leader需要在发送一个log的RPC后立刻更新他的nextIndex，而不是等待RPC的回复
+
+这样我们就可以pipeline下一个entry
+
+当RPC超时的时候，我们就需要去减少对应的nextIndex。当consistency check失败的时候，leader就需要减少nextIndex并重新发送前面的entry，或者等待前面的entry发送成功
+
+同时我们还需要支持对每一个peer的多个并发RPC，这需要我们对每个peer创建多个thread来支持
+
+reorder的情况会导致pipeline的效率下降。所以如果我们可以去buffer out-of-order requests直到他们可以按照顺序append的话，就可以获得效率上的提升。（这就需要应用层的优化了，因为tcp层不知道我们的log谁先谁后）
