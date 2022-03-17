@@ -48,3 +48,32 @@ ApplyVertex函数定义了在vertex上的计算，输入是`vertex data`，聚�
 这个则是G-GCN在SAGA-NN模型上的实现
 
 数据流抽象使我们表达神经网络结构以及自动微分更加容易。通过well-defined stages来建模GNN，可以让我们在graph computation以及dataflow scheduling进行优化
+
+# NeuGraph System
+
+NeuGraph包含了
+
+1. 翻译引擎，用来将SAGA-NN表示的GNN翻译成chunk-granularity的dataflow graph
+2. streaming scheduler来减少在GPU以及主机之间的data movement，并且最大化communication和computation之间的overlap
+3. graph propagation engine来提供各种算子
+4. dataflow execution runtime（这是用来干啥的）
+
+## Graph-Aware Dataflow Translation
+
+由于图数据无法放入到GPU中，所以目前的DL framework不能在GPU上直接使用
+
+2D graph partitioning
+
+将顶点数据划分成p等份。然后将邻接矩阵放到P×P的矩阵中
+
+![20220317220409](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220317220409.png)
+
+其中Eij中包含了Vi到Vj的边
+
+这样划分的时候，我们可以对每个chunk单独进行处理，同时只会涉及到原点和目标点。这样就可以放到GPU中进行计算。
+
+![20220317221050](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220317221050.png)
+
+figure5是计算v0的过程，前向传播
+
+对于反向传播来说，由于ApplyEdge和ApplyVertex都是由tensor组成的dataflow computations。所以我们可以通过自动微分来的到反向传播的梯度。
