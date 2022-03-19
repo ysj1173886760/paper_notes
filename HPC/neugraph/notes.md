@@ -76,4 +76,12 @@ NeuGraph包含了
 
 figure5是计算v0的过程，前向传播
 
-对于反向传播来说，由于ApplyEdge和ApplyVertex都是由tensor组成的dataflow computations。所以我们可以通过自动微分来的到反向传播的梯度。
+对于反向传播来说，由于ApplyEdge和ApplyVertex都是由tensor组成的dataflow computations。所以我们可以通过自动微分来的到反向传播的梯度。同时还提供了`backward-Scatter`和`backward-Gather`，一个用来收集梯度，一个用来分发梯度
+
+计算的过程不需要全局的barrier，根据依赖关系不断的调度即可
+
+在计算的时候，我们可以使用row-oriented或者column-oriented。对于前向传播来说，如果使用row-oriented的方法，那么要存储accum的结果的节点就会很多，导致我们不能很好的复用accum（虽然我们可以复用当前的节点），而对于column-oriented的情况下，我们可以直接计算出某一个chunk的accum的值，而且好处是这个accum的值还可以继续复用，在下面的ApplyVertex stage中我们可以用这个值来更新对应的节点。所以对于前向传播来说，column-oriented的方法更好一些
+
+而对于反向传播的情况，梯度会从终点传向起点。所以在row-oriented的情况下，我们可以复用一个chunk下起点的梯度，并且后续可以直接更新他
+
+决定vertex chunk的数量P也是比较关键的。比如在前向传播的时候，我们使用column-oriented，那么就需要进行P次IO来加载源点的chunk。所以希望有一个更小的P。在NeuGraph中，他们选择的就是能保证每个chunk存到GPU中最小的P
