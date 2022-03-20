@@ -84,4 +84,88 @@ figure5是计算v0的过程，前向传播
 
 而对于反向传播的情况，梯度会从终点传向起点。所以在row-oriented的情况下，我们可以复用一个chunk下起点的梯度，并且后续可以直接更新他
 
-决定vertex chunk的数量P也是比较关键的。比如在前向传播的时候，我们使用column-oriented，那么就需要进行P次IO来加载源点的chunk。所以希望有一个更小的P。在NeuGraph中，他们选择的就是能保证每个chunk存到GPU中最小的P
+决定vertex chunk的数量P也是比较关键的。比如在前向传播的时候，我们使用column-oriented，那么就需要进行P次IO来加载源点的chunk。所以希望有一个更小的P。在NeuGraph中，他们选择的就是能保证每个chunk存到GPU中最小的P。论文中这里的观点是通过次数来计算，但是如果看数量的话，总共加载的数据数量都是一样的。
+
+## Streaming Processing out of GPU Core
+
+### Selective Scheduling
+
+由于有的时候一个edge chunk不会用到对应的vertex chunk中所有的点，比如上面figure5中的左下角chunk，就没有用到2这个点。所以为了减少CPU到GPU的数据传输，每次在CPU的数据中应用一个filter，把用不到的顶点过滤掉
+
+但是这种做法对于random partition的情况下效果不好，比如我们比较希望的是比较密集的边块用到了所有的顶点，稀疏的边块只用到很少一部分。但是对于随机分区的情况下边块的分布也是均匀的。所以通过locality-aware graph partition的方法，让连在同一个点的边尽量都压缩到一起。这样就可以构成较为密集的边块。这样在访问顶点的时候就会有更强的局部性
+
+当大多数顶点都是有用的时候，这时候不去应用filter是更快的，因为filter也会引入一次额外的CPU中的内存复制。所以通过有效顶点的比例以及GPU和CPU的速度来综合考虑
+
+### Pipeline Scheduling
+
+通过pipeline来重叠通信和计算的开销。比如当我们计算当前的edge chunk的时候，就可以将下一个edge chunk传入
+
+在这种情况下，更小的chunk size会有更好的overlap的能力。类比CPU中的超流水
+
+但是之前又说过希望通过扩大chunk size来减少IO。所以为了解决这种问题引入了sub-chunk。把每个edge chunk和对应的source vertex分割成若干个sub-chunk，这样我们就可以去并行的处理这些sub-chunk。
+
+？？？我怎么感觉有点奇怪，这分割成了sub-chunk不是和分割为更小的p是一样的吗？
+
+对于不同的sub-chunk我们可能有不同的数据传输量以及计算开销。所以为了更好的pipeline，NeuGraph在开始的时候首先生成一个随机的处理顺序，然后他会不断的交换sub-chunk的处理顺序，直到处理的时间收敛。（只交换sub-chunk，可能是为了防止破坏局部性）
+
+![20220320092309](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220320092309.png)
+
+NeuGraph在前几次iteration收集每个sub-chunk的计算以及传输时间。然后在后面的iteration中，他会模拟当前schedule order的执行时间。看figure6,系统会找到传输时间远大于计算时间的sub-chunk，以及计算时间远大于传输时间的sub-chunk，并尝试交换他们，从而找到更好的执行顺序。
+
+这里还是感觉怪怪的。
+
+# Parallel Multi-GPU Processing
+
+感觉可以很直观的想到，forward的时候，一个GPU处理若干个dst vertex，他们之间不会有相互的关联
+
+![20220320101556](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220320101556.png)
+
+通过figure7可以看到，GPU之间的连接有的也是要通过CPU的。并且他们共享着PCIe总线。当GPU0和GPU1同时搬运数据到DRAM的时候，他们的带宽是跑不满的。我们会受到上层链路的限制
+
+为了解决这个问题，NeuGraph使用一种chain-based streaming scheduling模式。因为每一个vertex chunk都会所有的GPU使用，所以我们可以通过GPU之间的PCIe switch来转发这些vertex chunk，而不是走DRAM这条线
+
+NeuGraph认为在相同PCIe switch下的GPU是一个大的virtual GPU
+
+传递数据的顺序就是figure7中的红线
+
+对于每个GPU来说，他们有两种操作，一种是从DRAM中加载edge chunk，或者从DRAM或者他的上一个GPU中加载vertex chunk，第二种就是执行计算
+
+![20220320150815](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220320150815.png)
+
+在figure8中演示的。最开始GPU0和2加载V0，并开始计算，与此同时他们可以从DRAM中开始传输V1的数据。而对于GPU1和3来说，他们会开始从GPU0和2那里获取V0的数据。之后系统就可以这样一直pipeline下去
+
+# Graph Propagation Engine
+
+在ApplyEdge阶段，每一个顶点都有若干个出边，每次我们都会让顶点数据去与参数矩阵做矩阵乘法，从而导致很多的冗余计算。所以把这些独立的计算放到上一层中来消除冗余
+
+在大多数的GNN计算中，ApplyEdge只会去做一些element-wise的操作，在这种情况下我们可以去融合这些算子，让他们可以直接在GPU寄存器中存储数据，而不需要涉及到数据的复制以及中间数据的暂存。NeuGraph将SAG融合成一个操作叫做Fused-Gather。他会首先加载Scatter的输入，比如源点数据或者边，然后用GPU线程来执行in-place的更新，最后生成每个点的acc。（我的理解就是将前面的GNN处理阶段的操作fuse一下）
+
+# Implementation
+
+在tensorflow的基础上额外提供了
+
+1. 将vertex-centric symbolic program转化成dataflow
+2. streaming scheduler
+3. graph propagation engine以及优化的kernel，用来实现Gather/Scatter operator
+
+## Dataflow Translation
+
+NeuGraph提供了和传统operator类似的GNNlayer。他会将点和边划分成chunk，并根据user program来将GNNlayer和Gather/Scatter组合起来，生成基于chunk的dataflow graph
+
+## Streaming Scheduler
+
+scheduler会尝试优化dataflow graph。然后根据有效顶点的数量决定是否使用filter。以及profile执行时的数据，并优化plan
+
+## Multi-GPU Execution
+
+在NeuGraph中，不同的GPU会并发的执行（我理解是用于通信用的）算子，在每个算子中他会申请空间并与其他的设备交换这些地址，从而实现D2D的数据传输。在不同的GPU中我们还需要去在每个iteration之间同步参数，这个是通过all-reduce来实现的。（？为什么不传输到CPU中然后用PS呢）
+
+## Graph Propagation Engine
+
+NeuGraph实现了gather，scatter，fused-gather。
+
+scatter是一个map operator，将vertex data转化成edge data
+
+gather则是一个reduce operator，用来累加edge上的数据
+
+fused-gather则是当edge计算都是element-wise的时候，对应的one-pass computation
