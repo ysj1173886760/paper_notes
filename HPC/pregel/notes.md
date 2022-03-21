@@ -1,0 +1,39 @@
+# Introduction
+
+pregel的program model类似BSP。每一个iteration叫做一个superstep。每一个superstep，系统会在读取上一个superstep传给顶点的数据，并应用user-defined function，然后他会沿边将数据传输出去，从而让他的邻居在下一个superstep使用这些数据
+
+这种做法和MapReduce非常像，用户给出处理每个顶点的逻辑，然后系统会将这个操作应用到大规模的数据集上，并且不会暴露出执行顺序以及superstep之间的通信细节。
+
+# Model Of Computation
+
+pregel的输入就是一个有向图，其中边和点都可以有权值。
+
+pregel的计算过程：输入图数据，然后初始化图，然后进行由global synchronizatio point分割的superstep，直到收敛
+
+算法什么时候终止取决于vertex是否选择去halt。每个vertex最开始都是active的，当他们不再参与计算了（比如最短路里距离收敛了），他们就会vote to halt，进入inactive的状态
+
+![20220321101002](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220321101002.png)
+
+每个vertex的状态机表示。当其他的节点发送信息的时候，他们就会再次被激活（比如spfa中更新了节点距离，那我们就要让这个节点入队）
+
+一个传播最值的例子
+
+![20220321101536](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220321101536.png)
+
+图上的算法可以被表示为一系列的MapReduce操作。但是MapReduce是函数式的，对于多个链接起来的MapReduce操作来说，我们需要去传输整个状态。而对于pregel用的这种模型，我们只需要传输messages（顶点的数据之类的东西）。从而减少网络的负担
+
+# API
+
+pregel提供了一个aggregator，每次superstep每个顶点都可以向aggregator发送一些消息。aggregator就可以聚合并统计这些信息。比如计算当前图的边数等
+
+同时aggregator也可以用做global coordination的方法。因为每个顶点都可以访问到aggregator中的数据，所以我们可以在aggregator中通过一些谓词来判断是否满足条件。
+
+还可以通过aggregator来实现一些高级的操作，比如分布式的优先队列。在当前superstep中，每个节点发送他们的index以及distance。然后在aggregator中统计出最小距离的顶点们，让他们在下一个superstep中继续更新。
+
+某些算法需要去更改图的拓扑结构，比如聚类算法可能将一个cluster替换成一个vertex。或者MST（最小生成树）可能会移除很多边。这时候我们就可能出现竞争，比如两个顶点同时要求添加一个idx相同但是初始值不同的顶点。
+
+通过partial ordering和handler来解决这个问题。在一个superstep中，我们首先删边，然后删点，然后添加点，再添加边，最后根据Compute执行mutation。这种偏序关系让我们可以解决掉很多的冲突
+
+剩余的竞争则是通过用户指定的hanlder来处理。比如添加或者删除相同的vertex或者edge。否则的话系统可能挑选任意一个操作来执行
+
+pregel的coordination mechanism是lazy的。对于这些global mutations（我理解就是图的拓扑结构变化），直到他们真的被应用的时候才会去协调冲突，从而有助于stream processing。比如对于一个点V的修改的冲突会在V上体现出来的时候再去让V自己来协调。而不是说让一个global coordinator去协调所有的操作。
