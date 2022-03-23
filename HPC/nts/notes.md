@@ -71,3 +71,38 @@ DepCache的训练过程
 这里需要同步的原因是我们每一个节点在同一层中使用的参数是相同的，所以有一个隐含的共享点就是需要共享模型
 
 更新这个共享模型我感觉会需要很大的开销
+
+![20220323210348](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220323210348.png)
+
+相比与DepCache，DepComm就会显得复杂一些
+
+最开始还是先分区
+
+然后对于每一层来说，首先拿到remote worker上的数据，然后跑algorithm1
+
+反向传播则是会首先计算顶点的梯度。然后把这些部分梯度发送给对应的remote worker
+
+最后同步的更新参数
+
+### Existing GNN Systems Review
+
+对于DepCache的系统来说，为了减少重复的计算，他们只采样一部分多跳邻居的信息来进行训练
+
+sampling通常和mini-batch梯度下降训练方法相结合。虽然会牺牲一定的准确性，但是我们可以处理大规模的图数据了
+
+对于DepComm的系统来说，他们不会有精度下降因为他们没有冗余的计算。所以他们的目的主要是去优化worker之间的通信以及主机和GPU之间的通信。
+
+![20220323211440](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220323211440.png)
+
+## Performance of the Two Approaches
+
+![20220323211813](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220323211813.png)
+
+通过vary一些参数去观察两种方法的性能
+
+第一个图则代表了不同的图输入的情况，比如不同的依赖情况的影响
+
+第二个图代表了不同的隐藏层大小，影响了DepComm传输数据时的大小
+
+第三个图则vary了集群的环境，对应不同的网络带宽以及不同的计算能力
+
