@@ -106,3 +106,52 @@ sampling通常和mini-batch梯度下降训练方法相结合。虽然会牺牲�
 
 第三个图则vary了集群的环境，对应不同的网络带宽以及不同的计算能力
 
+结论就是DepCache适合少依赖，较大的hidden layer size，以及高算力的集群
+
+DepComm适合多依赖，较小的hidden layer size，以及高网络带宽的集群
+
+# Hybrid Dependency Management
+
+通过一个cost model来量化冗余计算开销以及通信开销。
+
+![20220324200105](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220324200105.png)
+
+冗余计算的公式，其中V(u)表示的就是u的入点，E(u)表示的就是入边
+
+比如第一层的1号点，他的V就是0,3,5。因为他在上一层的入点就是0,3,5
+
+而他的E就是(0,1),(3,1),(5,1)
+
+![20220324201729](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220324201729.png)
+
+其中d表示的是第k层的维度。Tv和Te表示每一维的vertex tensor和edge tensor计算的代价。注意本地的顶点和边集被去除掉了
+
+而对于DepComm来说计算开销就容易一些
+
+![20220324205941](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220324205941.png)
+
+u节点在第l层的通信开销其实就是把l-1层的u节点传过来。Tc表示的就是每一维传输的开销。d表示的就是维度
+
+Hybrid的方法则是根据cost model，选择部分节点做DepCache，选择部分节点做DepComm
+
+这里我截图一下原文
+
+![20220324210359](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220324210359.png)
+
+D表示远端的依赖，R表示DepCache的集合，C表示DepComm的集合。由R和C一同构成远端的依赖
+
+结合起来考虑GNN的计算代价就是
+
+![20220324210517](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220324210517.png)
+
+其中miu是一个因子，因为DepCache的情况下很多的计算依赖都是有重复的。我们应该只计算一次
+
+我们的任务就是找到最优的R和C的集合。这个问题可以被转化成一个经典的NP hard问题，叫做0/1 linear planning problem
+
+![20220324211047](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220324211047.png)
+
+Algorithm4是一种贪心的方法来解决这个问题。
+
+第一行是通过在一个小型的测试图上去探测前面需要的factor Tv，Te和Tc
+
+然后预计算出每一个节点在每一层的依赖
