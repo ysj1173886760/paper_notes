@@ -155,3 +155,39 @@ Algorithm4是一种贪心的方法来解决这个问题。
 第一行是通过在一个小型的测试图上去探测前面需要的factor Tv，Te和Tc
 
 然后预计算出每一个节点在每一层的依赖
+
+然后对于每一层，首先把每个节点的tr值放到优先队列里。然后不断取出最小的tr值的依赖点u。如果这个点的tr小于tc，说明用Cache的方法更好，我们把它加入到R中，并且把这个点的依赖点加入到我们已有的依赖集合Vrep中
+
+最后剩下的没加入R的就是用DepComm的
+
+依赖管理和图分区是正交的，所以可以使用不同的图分区策略来配合hybrid的依赖管理
+
+# NTS
+
+![20220325085310](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220325085310.png)
+
+nts的架构，根据那些子模块也可以看到nts应用的优化
+
+lock-free的队列，任务的重叠，Ring-based通信以及基于source的sub-chunking
+
+![20220325090236](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220325090236.png)
+
+其他的和NeuGraph类似，主要就是GetFromDepNbr这块。这里会根据hybrid的策略来选择是从远端拉取数据还是说从本地拿缓存
+
+![20220325090340](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220325090340.png)
+
+这里则是一层GNN计算的过程。可以看到最后的参数更新是通过All-reduce完成的
+
+![20220325091312](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220325091312.png)
+
+figure7中演示的是nts的DepComm的实现，通过master-mirror来实现双向通信
+
+partition0的1和0先发给partition1的结点2。反向传播的时候则是2结点发送给0和1,然后再发送给远端的master节点
+
+![20220325093040](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220325093040.png)
+
+ring-based的scheduling
+
+后面应该和gemini就类似了
+
+最后这个lock-free的队列，貌似不是普通的lock-free，而是说通过目的地直接指定写入的位置，从而避免写冲突。
