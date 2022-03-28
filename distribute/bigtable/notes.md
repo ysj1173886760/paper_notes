@@ -134,4 +134,72 @@ metadata table中的行也是kv的，其中value就是tablet的位置，而key�
 
 并且这些tablet的数据都是存储在主存中的，所以不需要去额外的访问GFS。我们也可以通过去预取tablet location来减少查询时候的成本。
 
-在metadata table中还额外存储了一些log，比如什么时候一个服务器开始服务对应的tablet。从而实现debugging和performance analysis
+在metadata table中还额外存储了一些log，用来存储一些事件，比如什么时候一个服务器开始服务对应的tablet。从而实现debugging和performance analysis
+
+## Tablet Assignment
+
+master跟踪当前有那些tablet server。以及tablet的分配信息。如果有tablet未分配给tablet server的时候，master就会找一个有足够空间的tablet server，发送一个tablet load request来将该tablet分配给他。
+
+bigtable通过chubby来跟踪tablet server。当一个tablet server启动了，他就会在chubby的namespace中的一个特定目录下创建一个唯一的文件，并获得上面的锁。
+
+master通过监视这个目录来追踪tablet server。当tablet server失效的时候，他就会失去对应chubby上的锁。由于网络分区的情况下，一个活着的服务器可能会丢失他与chubby的会话，他会重新尝试获得这个文件上的锁。如果文件被删除了，tablet server就会自杀，因为他可能重新获得锁了。
+
+当一个tablet server不再服务的时候，master负责将他之前负责的tablet重新分配。master会定期的向tablet server询问他们的状态（而不是向chubby）。当tablet server报告说他的锁失效的时候，或者master和tablet server出现分区的时候。master就会去chubby上自己尝试获得这个锁。如果master成功了，说明chubby没问题。那么master就会删除掉这个server的文件，从而保证他无法再服务。然后将这个tablet server之前的tablet放到未分配的表中。
+
+当master与chubby的session过期的时候，master就会自杀。（我猜测是要开一个新的master继续服务，否则当一个tablet server失效的时候，master同时也失效了，那么这些对应的tablet就会是失效的状态）
+
+当master启动的时候，他需要知道那些tablet被分配了，那些没有。master顺序执行以下步骤
+1. master首先获取chubby中的master lock
+2. master扫描chubby中的server directory。找到所有的在线的服务器
+3. master与这些服务器通信，获知他们已经被分配了那些tablet
+4. master去扫描metadata table，当遇到没有被分配的tablet的时候，他就会记录这些tablet
+
+注意上面的步骤中，如果metadata table没有被assign的话，我们是无法去查找的。所以master会额外记录root table是否被assign了。
+
+还有一点就是tablet的分裂，是由tablet server开始的。tablet server通过在metadata表中记录新的tablet的信息来提交这次split。当split被提交，tablet server就会告诉master。但是如果master或者tablet server失效的话，这个通知就会丢失。比如原本的tablet被分配到另一个服务器的时候，master会让新的tablet server去load这个tablet。新的tablet server就会发现数据已经被split了（比如通过范围等），这时他就可以告诉master这个数据已经被split了。
+
+## Tablet Serving
+
+![20220328100330](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220328100330.png)
+
+对于修改操作来说，我们通过提交log来实现。最近提交的修改会被存储到主存中，叫做memtable。而老一些的修改则会被存储到SSTable中
+
+对于重构一个tablet来说，metadata table中存储了一个SSTable的列表，以及一系列的redo point。服务器会把SSTable的索引读入到主存中（用来后续查找），并且根据redo point之后的日志重构memtable
+
+当一个写操作到达tablet server的时候，server首先检查写操作是不是完好的，以及发送者的权限。（权限是通过读取Chubby中的一个存储了有权限写的writer列表的文件来实现的）
+
+一个有效的更改操作会被写到日志中。组提交用来提高很多小型更改的吞吐量。当log提交了以后，这个更改就会被应用到memtable中
+
+对于读操作来说，他也会首先检查操作的格式，以及权限。读操作会在memtable以及一系列的SSTable上进行操作。因为SStable以及memtable是有序的，所以我们可以实现高效的查找
+
+由于我们的SSTable都是有序的，所以split以及merge的操作不会影响到我们的正常读写操作。
+
+## Compactions
+
+memtable会不断变大，当我们不断执行写操作。当memtable的大小到达了一个阈值的时候，现有的memtable会被冻结。我们会创建一个新的memtable。同时现有的memtable会被转化成一个SSTable并写入到GFS中。
+
+这个过程叫做minor compaction这样做有两点好处
+1. 减少memory useage
+2. 减少了恢复时所需要重放的redo log
+
+但是如果SSTable不断的增长，我们的读请求会需要查很多的SStable。通过周期性的执行一个后台的merging compaction。merging compaction会读取一些SSTable以及memtable，并输出一个新的SSTable。那些老的SSTable和memtable就可以安全的被删除掉
+
+将所有的SSTable都合并为一个SSTable的叫做major compaction。对于某些删除的数据来说，他们会在老的SSTable中存在，而在新的SSTable中被记录为删除。当执行了major compaction以后，我们就只会保存一个版本的数据，不需要去记录那些数据被删除了。bigtable周期性的对tablet进行major compaction。从而允许我们进行垃圾回收。这也保证了数据的删除是一个周期性的操作，为一些敏感数据提供了很好的保证。
+
+# Refinements
+
+这一节描述了对前面实现的一些调整，从而达到高性能，高可用
+
+## Locality groups
+
+用户可以将若干个列族分组到一起成为一个locality group。每个locality group对应了一个SSTable。通过分离不常一起访问的列族可以带来更加高效的读取。因为可以涉及到更少的GFS读
+
+用户还可以指定一个locality group的读取方式，比如加载到主存。这样对应的SSTable在读取的时候就会被加载到tablet server中的主存中，后续的读取就会变快。这个技术对于频繁的小块的数据读取很有用，比如在metadata table中的location column family就是这样设置的。
+
+## Compression
+
+用户可以控制一个locality group的SSTable是否被压缩。我们可以单独的压缩每个SSTable块（这里应该指的就是一个locality group对应的SSTable），从而可以让我们读取一小块数据，而不需要去解压缩整个SSTable。（我感觉这里的核心点应该还是locality group的隔离性，让我们可以分开压缩）
+
+论文中提到他们使用的两阶段压缩主要是为了快速，但是他们的空间压缩比也很高。因为在SSTable中是按序存储的，这时候相似的数据都会存储到一起。从而让一些基于滑动窗口的算法的压缩比很高。并且在SSTable中存储多个版本的文件的时候压缩比会更高。
+
+这里个人想法就是因为workload了。网页中相同的host的网页内容的样板也很类似。但是核心还是在于locality group的隔离性，让我们可以分开压缩分开读取。从而在减少空间使用的同时快速的读取。当然这也需要用户来指定访问的pattern。
