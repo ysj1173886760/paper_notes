@@ -203,3 +203,73 @@ memtable会不断变大，当我们不断执行写操作。当memtable的大小�
 论文中提到他们使用的两阶段压缩主要是为了快速，但是他们的空间压缩比也很高。因为在SSTable中是按序存储的，这时候相似的数据都会存储到一起。从而让一些基于滑动窗口的算法的压缩比很高。并且在SSTable中存储多个版本的文件的时候压缩比会更高。
 
 这里个人想法就是因为workload了。网页中相同的host的网页内容的样板也很类似。但是核心还是在于locality group的隔离性，让我们可以分开压缩分开读取。从而在减少空间使用的同时快速的读取。当然这也需要用户来指定访问的pattern。
+
+## Caching for read performance
+
+bigtable有两层cache
+1. Scan Cache用来存储kv对，所以对于重复的数据请求我们就可以直接返回结果
+2. Block Cache用来缓存从GFS中读到的SSTable块，这样我们就有一定的访问局部性
+
+## Bloom filters
+
+在上面描述读操作的时候，我们需要读取所有的SSTable直到找到最新的row。我们可以对每个SSTable创建一个bloom filter，这样可以快速确定SSTable中是否含有某个特定的行。通过在主存中放置bloom filter可以极大程度的减少我们访问GFS的频率。
+
+## Commit-log implementation
+
+如果我们对于每个tablet的log都独自存储一个文件，这样的话大量的文件写就会并发的去请求GFS。所以为了解决这个问题。使用的方法是一个tablet server一个commit log。
+
+虽然一个log可以提高我们的性能，但是缺点就是当一个tablet server失效了，他负责的tablet可能分发到其他几个不同的tablet server中。
+
+这样如果tablet分发到100个机器中，我们就会有100次重复读取，每个机器都只重放他对应的tablet的日志。
+
+通过排序log来防止这种重复的读。这样一个tablet中的log就会放到一起
+
+![20220328140256](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220328140256.png)
+
+论文里提到的两个写入线程有点奇怪，这里没搞懂
+
+## Speeding up tablet recovery
+
+如果master将一个tablet从一个服务器移动到另一个服务器。那么源服务器会首先做一次minor compaction。这样可以减少在那个tablet上的恢复时间。然后源服务器停止服务，在他卸载掉这个tablet之前，他会再做一次minor compaction。因为我们之前的压缩不会停止服务，所以在这个过程中可能又有新的log。所以在新的tablet server加载tablet的时候，他不需要任何的恢复。（目的应该是把log的恢复移动到SSTable中，因为我们的log都是写在一起的，再去排序比较耗时）
+
+## Exploiting immutability
+
+由于我们的SSTable都是不可变的，所以并发的操作不需要任何的同步手段。所以只有memtable是可变的，我们只需要在memtable上面实现简单的并发控制，就可以很容易的得到单行事务的支持。
+
+为了不阻塞读，在memtable上实现COW，从而可以让读写并发的操作（MVCC，同时bigtable也有记录多版本的需求，所以很自然的就用多版本并发控制就好）
+
+SSTable是不可变的，所以删除数据的操作就会转化为对SSTable的垃圾回收。我们通过在metadata table中移除掉对应的SSTable作为垃圾回收的标志。
+
+同时由于SSTable是不可变的，我们在split的时候不需要去为每一个child生成一个新的SSTable，而是直接让child共享父SSTable
+
+（这个共享的思路很棒呀，这样我们只需要重定向新的请求到对应的child中，他们新的memtable和SSTable就是对应范围的表，而老的表就直接查父亲的就行。之后就可以通过compaction去回收父亲的表，但是要额外加一个refcnt，两个人都用完才能真的删除这个SSTable file）
+
+有一点要注意就是上面说的两级cache是在SSTable上的，而不是tablet。并且由于SSTable的不可变性，只要SSTable还在，缓存就有效
+
+极客时间这个图比较好
+
+![20220328145227](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220328145227.png)
+
+# Performance
+
+![20220328151004](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220328151004.png)
+
+看这个图后面的scale的问题
+
+没有线性拓展的一个主要因素就是负载均衡的问题。因为负载均衡需要我们移动tablet，从而导致一段时间的不可用。
+
+随机读是性能最差的一个，因为每次读都需要我们从GFS中传输一个整块的文件。
+
+对于顺序读写论文中没写，但是我觉得是受到了GFS的限制
+
+# Lessons
+
+大型分布式系统对于很多类型的错误都是非常脆弱的。而不是只是network partition以及失效等问题。
+
+比如内存以及网络的错误导致的问题。时钟的偏斜。挂起的机器。非对称的网络分区。以及其他系统中的bug
+
+另一个问题就是去延迟添加新的feature，直到我们清楚的理解到新的feature是怎么使用的。
+
+最关键的一点是simple designs。最开始的时候tablet server的管理是通过master去发送lease来进行的。当一个tablet server的lease过期了，他们就会自杀。这个方法减少了我们系统的可用性，并且严重依赖于master的恢复时间。可能这也是为什么后来GFS被替换掉。
+
+所以分离了这个职责给chubby，而master只负责管理tablet的分配，不负责处理tablet server的成员管理。
