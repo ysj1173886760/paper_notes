@@ -283,3 +283,11 @@ SSTable是不可变的，所以删除数据的操作就会转化为对SSTable的
 所以分离了这个职责给chubby，而master只负责管理tablet的分配，不负责处理tablet server的成员管理。
 
 最后列一下我感觉比较不错的一个[文章](https://www.read.seas.harvard.edu/~kohler/class/cs261-f11/bigtable.html)，通过re-build的方式来讲解bigtable的设计
+
+bigtable使用列族的主要目的：假设bigtable只是简单的kv-storage，由于我们只能保证单行的事务。那么我们能做的就只是原子的对一个值进行更改，这对于大多数的用户来说都是不够的。所以bigtable拓展了行的概念，让我们在一行里可以存储若干个kv对，并且不同的行还可以有不同的键。这样我们原本的atomic value operation就可以拓展成atomic structure operation。
+
+所以虽然不支持整体的事务，但还是提供了一定程度的简便的编程模型。最直观的体现就是我们之前只能原子改一个值，现在可以改多个了。
+
+![20220328191343](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220328191343.png)
+
+和db的对比
