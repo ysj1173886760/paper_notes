@@ -88,7 +88,9 @@ bigtable用GFS来存储log和数据文件。同时依赖一个集群管理系统
 
 用SSTable file来存储bigtable的额数据。SSTable可以提供一个持久化的不可变的map。
 
-每一个SSTable都存储了一系列的块。我们通过block index去索引这些块。当SSTable被打开的时候，这些索引是存储在主存中的。当我们想要查找某些数据的时候，就会根据主存中的index来进行二分查找。然后再从磁盘中读取对应的块
+每一个SSTable都存储了一系列的块（64kb可配置）。我们通过block index去索引这些块。当SSTable被打开的时候，这些索引是存储在主存中的。当我们想要查找某些数据的时候，就会根据主存中的index来进行二分查找。然后再从磁盘中读取对应的块
+
+这样读取的时候就不需要读取整个的SSTable，而是根据块索引来进行读取。后面还会提到我们会对块进行分别的压缩，从而独立出块读取的操作。
 
 bigtable还依赖一个高可用的分布式锁服务Chubby。Chubby通过Paxos来保证副本的一致性。Chubby提供了一个namespace，里面的每个文件都可以用作一个lock，并且对这个文件的读写是原子的。
 
@@ -186,6 +188,12 @@ memtable会不断变大，当我们不断执行写操作。当memtable的大小�
 
 将所有的SSTable都合并为一个SSTable的叫做major compaction。对于某些删除的数据来说，他们会在老的SSTable中存在，而在新的SSTable中被记录为删除。当执行了major compaction以后，我们就只会保存一个版本的数据，不需要去记录那些数据被删除了。bigtable周期性的对tablet进行major compaction。从而允许我们进行垃圾回收。这也保证了数据的删除是一个周期性的操作，为一些敏感数据提供了很好的保证。
 
+所以注意一共是三种，minor compaction， merging compaction以及major compaction
+
+merging compaction和major compaction的不同？merging compaction只会涉及到最近的SSTable，通常比较快。并且他会保留tombstone标记，因为他不包含的数据可能在更老的SSTable中。而major compaction不涉及到memtable，并且压缩了所有的SSTable，所以他不需要包含tombstone
+
+很关键的一点就是这些操作都可以在后台进行并且是天然并发的，因为他们都是不可变的。而一些database则不行，因为他们要处理locking的问题
+
 # Refinements
 
 这一节描述了对前面实现的一些调整，从而达到高性能，高可用
@@ -198,7 +206,7 @@ memtable会不断变大，当我们不断执行写操作。当memtable的大小�
 
 ## Compression
 
-用户可以控制一个locality group的SSTable是否被压缩。我们可以单独的压缩每个SSTable块（这里应该指的就是一个locality group对应的SSTable），从而可以让我们读取一小块数据，而不需要去解压缩整个SSTable。（我感觉这里的核心点应该还是locality group的隔离性，让我们可以分开压缩）
+用户可以控制一个locality group的SSTable是否被压缩。我们可以单独的压缩每个SSTable块，从而可以让我们读取一小块数据，而不需要去解压缩整个SSTable
 
 论文中提到他们使用的两阶段压缩主要是为了快速，但是他们的空间压缩比也很高。因为在SSTable中是按序存储的，这时候相似的数据都会存储到一起。从而让一些基于滑动窗口的算法的压缩比很高。并且在SSTable中存储多个版本的文件的时候压缩比会更高。
 
@@ -273,3 +281,5 @@ SSTable是不可变的，所以删除数据的操作就会转化为对SSTable的
 最关键的一点是simple designs。最开始的时候tablet server的管理是通过master去发送lease来进行的。当一个tablet server的lease过期了，他们就会自杀。这个方法减少了我们系统的可用性，并且严重依赖于master的恢复时间。可能这也是为什么后来GFS被替换掉。
 
 所以分离了这个职责给chubby，而master只负责管理tablet的分配，不负责处理tablet server的成员管理。
+
+最后列一下我感觉比较不错的一个[文章](https://www.read.seas.harvard.edu/~kohler/class/cs261-f11/bigtable.html)，通过re-build的方式来讲解bigtable的设计
