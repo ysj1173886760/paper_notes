@@ -236,6 +236,8 @@ bigtable有两层cache
 
 论文里提到的两个写入线程有点奇怪，这里没搞懂
 
+受到胡哥的指导，这里的意思是两个日志线程分别写不同的GFS文件，这样当一个GFS文件坏掉或者网路出现问题的时候，我们就可以写另一个GFS文件。从而减缓了GFS波动带来的影响。
+
 ## Speeding up tablet recovery
 
 如果master将一个tablet从一个服务器移动到另一个服务器。那么源服务器会首先做一次minor compaction。这样可以减少在那个tablet上的恢复时间。然后源服务器停止服务，在他卸载掉这个tablet之前，他会再做一次minor compaction。因为我们之前的压缩不会停止服务，所以在这个过程中可能又有新的log。所以在新的tablet server加载tablet的时候，他不需要任何的恢复。（目的应该是把log的恢复移动到SSTable中，因为我们的log都是写在一起的，再去排序比较耗时）
