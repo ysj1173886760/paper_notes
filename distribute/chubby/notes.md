@@ -74,3 +74,24 @@ chubby的node可以作为一个读写锁使用
 server可以通过chubby的cache，或者服务器最近发现的sequencer来检查请求的有效性。
 
 有些server还不支持sequencer，所以通过lock-delay的方法来解决。通过延迟去将这个锁分配给其他的人，我们希望让那些延迟的消息都被处理或丢失后再分配新的lock holder，从而防止delayed message导致的问题。
+
+## Events
+
+chubby客户端可以在创建handle的时候订阅一系列的事件。包括：
+
+* 文件内容更改
+* 子节点的增加删除或者修改
+* master失效
+* handle失效
+* 锁的获取（用来确定primary的选取）
+* 冲突的锁请求（用来允许锁缓存，论文里说没人用）
+
+## Caching
+
+为了减少read traffic，chubby的客户端会用一种write-through的方法缓存数据。通过租约的机制来保证缓存的有效性，同时通过master发送的消息来使缓存无效。
+
+master维护了一个列表，存储了客户端都会缓存什么东西。
+
+当文件数据改变的时候，这个操作会被阻塞住，此时master会把数据无效的信息发送给所有具有这个缓存的客户端中。
+
+当服务器知道所有的客户端都消除了缓存以后，他才会继续进行更改（相当于2PC）
