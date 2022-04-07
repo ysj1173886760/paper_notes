@@ -1,0 +1,39 @@
+# Abstraction
+
+论文中说这个percolator是用来进行增量处理的一个系统，用来替换MapReduce在google indexing system中的作用
+
+但是没有提到transaction相关的东西
+
+# Introduction
+
+考虑我们为网页构建索引的任务。索引系统首先会把每个网页都爬下来，如果有多个URL都指向了相同的内容，那么拥有最高的PageRank的URL会被保留下来放到索引中。我们还会把每一个链接对应的anchor text附在他指向的页面中。同时要保证对于链接指向的重复的内容，我们也会把它转发到PageRank最高的副本中
+
+这个任务可以通过一系列的MapReduce来完成，一个用来聚合重复的页面，一个用来做链接反转。在MapReduce中，一个任务结束后才能开始另一个任务，所以在做链接反转的时候我们不需要考虑PageRank的变化
+
+现在考虑这样的情况，我们重新爬取了一部分小的网页。要想计算新的PageRank，我们必须对整个集合做MapReduce，而不是新的这一部分增量。从而导致任务的规模是与整个仓库而非新增加的网页成比例的
+
+我们可以通过把仓库存储在DBMS中，然后通过事务来帮助我们维护不变量（即多个副本指向PageRank最高的内容等）。虽然Bigtable有了可以处理这么多数据的能力，但是bigtable不能保证对于并发的操作去维护invariants
+
+所以我们需要一个可以用来做增量处理的系统，我们可以每次爬取小部分的数据，然后可以并发的去更新他们
+
+Percolator提供了SI的隔离级别。同时提供了observers。当系统发现一些用户指定的列变更的时候，他就会调用observer，每一个observer会完成他对应的任务，并且得到的结果会通过写入table从而导致下游的observer继续执行任务
+
+# Design
+
+Percolator提供了两种抽象，一个是为分布式系统提供了ACID保证的事务，一个是observer，用来做增量计算
+
+![20220407143742](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220407143742.png)
+
+Percolator由三个东西组成，Percolator worker，Bigtable tablet server以及GFS chunk server
+
+observer会通过RPC来在Bigtable上读写，然后Bigtable从而通过RPC来将数据存储在GFS上
+
+这个系统还依赖两个小的设施，timestamp oracle以及lightweight lock service
+
+timestamp oracle用来保证实现严格递增的timestamp，从而在实现SI中使用到
+
+worker通过使用lightweight lock来使搜索dirty notifications更加高效（这块不明白，后面再看看）
+
+Percolator的设计点在于在大规模机器上的执行，以及没有对latency的严格要求。从而让我们可以使用一个lazy的方法来清理transaction带来的锁。这种方式让transaction的提交时间延迟了数十秒，但是在indexing system中是可以忍受的。percolator没有一个中心化的事务管理位置，并且没有一个全局的死锁检测器。这会导致延迟的进一步增加，但是同时也允许我们在大规模数据上进行扩展。
+
+## Transactions
