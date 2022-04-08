@@ -77,3 +77,16 @@ transaction的构造函数会获得一个通过oracle获得一个timestamp作为
 如果client在写入primary后失效了，我们就必须执行向前滚动。后来的事务可以通过检查对应的primary上的数据来决定是否向前滚动。对于向前滚动的操作，就是写入对应的write record
 
 Percolator通过chubby判断worker是否活跃来确定事务是否被worker执行。同时他会在lock中写入wall time，如果一个锁的wall time很老，他也会被清理掉。而对于long-running commit的情况，他们会周期性的更新wall time。
+
+## Timestamps
+
+oracle server必须要可以scale，因为我们整个系统都依赖oracle server分配时间戳
+
+oracle server每过一段时间会从磁盘中分配一个范围的timestamp，这样后续的处理就可以直接在内存中进行。
+
+并且每个worker会将timestamp的请求进行批处理，这样一次可以请求多个timestamp，并且不会受到RPC开销的影响
+
+Percolator是怎么保证我们每次读都是读到的一致性快照呢？可以这样考虑：
+如果我们能够读到一个事务的写操作，那么就有Tw < Tr，即读操作的start timestamp要大于写操作的commit timestamp。而Tw只有在所有的锁都写入成功后才会请求到，所以我们可以在分配Tr的时候，Tw对应的锁都已经写入了，所以后续的读取就一定可以读到所有Tw的写入。
+
+后面的这个Notifications用处不大，就不在这里说了。主要目的是做增量计算用，而不是去维护数据的完整性
