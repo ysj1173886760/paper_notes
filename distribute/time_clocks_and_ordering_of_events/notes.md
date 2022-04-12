@@ -108,5 +108,15 @@ PC2. For all i,j: $| C_i(t) - C_j(t) | < \epsilon$
 PC1则指出$C_i(t + \mu) - C_i(t) > (1 - \kappa)\mu$
 然后根据PC2可以推导出当$\epsilon/(1 - \kappa) \leq \mu$的时候满足 $C_i(t + \mu) - C_j(t) > 0$
 
-然后说一下怎么保证PC2的情况，因为时钟会偏移，所以随着时间流逝他们会偏移的越来越多
+然后说一下怎么保证PC2的条件，因为时钟会偏移，所以随着时间流逝他们会偏移的越来越多
+
+m代表一个消息，从物理时间t发送，并在物理时间t\`接收。我们定义vm = t\` - t，作为消息m的总延迟。这个延迟对于收到消息的进程来说是感知不到的。我们可以假设一个最小延迟$\mu_m \geq 0$，并且$\mu_m \leq v_m$。我们称$\xi_m = v_m - \mu_m$为不可预测的延迟(unpredictable delay)
+
+我们现在为物理时钟定义一些规则：
+IR1\`： For each i, if Pi does not receive a message at physical time t, then Ci is differentiable at t and $dC_i(t) / dt > 0$
+IR2\`: (a) If Pi sends a message m at physical time t, then m contains a timestamp $T_m = C_i(t)$. (b) Upon receiving a message m at time t\`, process Pj sets Cj(t\`) equal to maximum(Cj(t\` - 0), Tm + $\mu_m$)
+
+现在考虑进程之间的关系为一个图，如果Pi到Pj有一条弧，则有一条消息会在每$\tau$秒从Pi向Pj发送一条消息。图的直径d则是对于图中的任意两个点，他们的之间最多有d条弧
+
+假设任意一个强连通的图都可以满足IR1\`以及IR2\`。假设对于任意的消息m，有$\mu_m \leq \mu$，以及对于所有的$t \geq t_0$，则有(a) PC1 holds. (b) There are constants $\tau$ and $\xi$ such that every $\tau$ seconds a message with an unpredictable delay less thant $\xi$ is send over every arc. Then PC2 is satisfied with $\epsilon \approx d(2\kappa\tau + \xi)$ for all $t \gtrsim t0 + \tau d$, where the approximations assume $\mu + \xi \ll \tau$
 
