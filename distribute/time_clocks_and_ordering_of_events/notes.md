@@ -118,5 +118,5 @@ IR2\`: (a) If Pi sends a message m at physical time t, then m contains a timesta
 
 现在考虑进程之间的关系为一个图，如果Pi到Pj有一条弧，则有一条消息会在每$\tau$秒从Pi向Pj发送一条消息。图的直径d则是对于图中的任意两个点，他们的之间最多有d条弧
 
-假设任意一个强连通的图都可以满足IR1\`以及IR2\`。假设对于任意的消息m，有$\mu_m \leq \mu$，以及对于所有的$t \geq t_0$，则有(a) PC1 holds. (b) There are constants $\tau$ and $\xi$ such that every $\tau$ seconds a message with an unpredictable delay less thant $\xi$ is send over every arc. Then PC2 is satisfied with $\epsilon \approx d(2\kappa\tau + \xi)$ for all $t \gtrsim t0 + \tau d$, where the approximations assume $\mu + \xi \ll \tau$
+假设任意一个强连通的图都可以满足IR1\`以及IR2\`。假设对于任意的消息m，有$\mu_m \leq \mu$，以及对于所有的$t \geq t_0$，则有(a) PC1 holds. (b) There are constants $\tau$ and $\xi$ such that every $\tau$ seconds a message with an unpredictable delay less thant $\xi$ is send over every arc. Then PC2 is satisfied with $\epsilon \approx d(2\kappa\tau + \xi)$ for all $t \gtrsim t_0 + \tau d$, where the approximations assume $\mu + \xi \ll \tau$
 
