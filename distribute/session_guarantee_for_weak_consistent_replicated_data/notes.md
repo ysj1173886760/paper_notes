@@ -95,3 +95,55 @@ PRAM没有对跨越session的操作做任何保证，所以我们加上WFR，来
 而对于sequential来说，则没有什么更多额外的保证，只是在不可比较的事件之间提供了一个全序关系，让我们可以排序没有因果的事件。那么有个问题就是，sequential是不是就没什么作用了，毕竟他也没提供real time的保证，只是排序了不相关的东西。其实不是，因为当我们无法排序不相关的事件的时候，那么我们就无法保证某一时刻数据库的一致性，比如两个写操作同时写入同一个数据项，怎么确保谁先谁后呢？就算是我们有确定的手段确保这个顺序，还是会有异常。比如我们某一时刻的读可能在两个不同的服务器上读到的是不同的状态，那么我们之后所做的抉择就取决于去那个服务器上读了，也是一个比较奇怪的现象。所以目前的系统如果可以都会提供这样的全序关系。
 
 # Providing the guarantees
+
+有一个session manager负责维护信息，并负责与服务器通信
+
+服务器需要提供给我们新的写操作对应的WID，读操作读到的数据对应的WID，以及当前数据库中所有的WID
+
+session manager维护了两组集合
+
+read-set = set of WIDs for the Writes that are relevant to session reads
+write-set = set of WIDs for those writes performed in the session
+
+RYW: 每次写操作被接受的时候，我们把返回的新的WID加入到write-set中，每次读的时候，session manager要检查write-set是当前数据库DB(S, t)的子集
+
+MR：每次读取的时候，session manager要保证read-set是DB(S, t)的子集，并且每次读取结束以后，要把读到的数据对应的RelevantWrites(S, t, R)加入到读集中
+
+实现WFR和MW需要我们添加两个限制：
+C1. 当服务器S在t时刻接受一个新的写操作W2的时候，他要保证对于现在数据库中的所有写W1,都有WriteOrder(W1, W2). 即新的写操作要保证被排序到已有的写操作后面
+C2. 在t时刻进行反熵，把W2从S1传播到S2的时候，我们要保证对于DB(S1, t)中所有的满足WriteOrder(W1, W2)的写操作W1，都已经被传播到了S2中。 即传播是按序的
+
+个人的想法：其实这里的C2间接的让WFRP依赖于WFRO了，也就是传播顺序依赖于Ordering。其实应该有其他的方法去避免，但是我们这里没有细分WFR，所以就直接结合起来了。从这里也可以看出来ordering在propagating中的重要性
+
+实际上，我们并不需要对于DB中所有的写操作都这样执行，而是只要保证session中的read-set和write-set中的写操作遵守这个规则就可以，因为有的写可以不走session。但是这需要服务器额外追踪读写集，不如全部满足更好
+
+幸运的是，很多的系统都满足这样的条件。对于新的写操作来说，他应该被放置在已有的写操作的后面。如果我们通过timestamp来计算WriteOrder这个谓词的话，那么我们只要保证新的写操作的谓词在已有的后面即可。
+
+WFR：和MR中相同，我们保证每次读取结束以后把对应的RelevantWrites(S, t, R)加入到读集中，然后在写的时候，我们保证当前服务器S1的DB(S1, t)包含read-set
+MW：每次服务器接受一个写操作的时候，他的DB(S, t)必须已经包含了当前的write-set。并且返回的WID要被加入到write-set中
+
+![20220419211131](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220419211131.png)
+
+# Practical implementation of the guarantees
+
+上一节说到做法可能会导致一些问题：
+* WID的集合可能很大
+* 读操作对应的WID集合可能很大
+* 在检查读写操作时候使用的WID集合可能很大
+* 服务器记录WID的信息可能很大
+* 查找一个有效的服务器可能会很费时
+* 记录读操作对应的写操作这个过程可能会很多
+
+这一节通过version vector来解决大多数的问题
+
+每次写的时候，我们递增clock字段，这样(server, clock)就可以作为WID使用
+
+invariant: if a server has (S, c) in its version vector, then it has received all Writes that were assigned a WID by server S before or at logical time c on S's clock. 
+
+根据这个invariant，服务器需要保证他们在反熵的时候，传播的顺序是根据WID的顺序来的。即当我们有(S, c)的数据的时候，之前的数据也应该被传过来。同时反熵的过程也会更新服务器的version vector
+
+要为一组写集Ws获得一个version vector。我们令V[S] = the time of the latest WID assigned by server S in Ws(or 0 if no Writes are from S)
+
+要获得两个写集的version vector的交集，我们只需要对于每一个服务器S，让V[S] = MAX(V1[S], V2[S])即可
+
+要检查两个集合是否存在包含关系，我们只需要判断一个vector是不是dominates另一个，即对于每一个元素都存在大于或等于的关系
