@@ -147,3 +147,27 @@ invariant: if a server has (S, c) in its version vector, then it has received al
 要获得两个写集的version vector的交集，我们只需要对于每一个服务器S，让V[S] = MAX(V1[S], V2[S])即可
 
 要检查两个集合是否存在包含关系，我们只需要判断一个vector是不是dominates另一个，即对于每一个元素都存在大于或等于的关系
+
+个人的想法：这样的话我们应该需要用logical clock作为version vector中的clock，否则无法满足新的写操作被排序在已有的写操作的后面。并且还有一个额外的问题，就是反熵的时候，我们不仅需要保证同一个服务器中的数据是按序的，还需要保证跨服务器的有依赖的写操作也是按序传播的
+
+并且我们无法很好的计算出读请求的RelevantWrites，因为这需要我们跟踪每个元组对应的version vector。所以我们可以让当前服务器的version vector作为这次读操作的RelevantWrites的一个近似
+
+![20220420095316](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220420095316.png)
+
+通过version vector简化了实现
+
+这里是我自己想的一个反熵的算法，目的是为了保证传播顺序
+
+因为version vector可以天然的帮我们保证一个服务器上的写是按序传播的。但是不保证不同服务器上有依赖的写是按序的。比如我们有两个写对应的是<S1, C1>和<S2, C2>，先在S1上写，然后到S2上，发现S1的写被传播过来，然后再写。这时候我们就需要保证MW，即在S2传播给其他服务器，比如说S3的时候，要保证首先把S1的写传过去，再传S2的写。
+
+首先通过logic clock保证C2 > C1,即WriteOrder(<S1, C1>,<S2, C2>)
+
+然后在反熵的过程中，S2会给S3传数据，首先他会要求获得S3的version vector
+
+然后他会尝试传播属于自己的写操作，即<S2, C2>这个数据。在传播之前检查，S3的version vector里是否满足了对于所有的满足WriteOrder(<S, C>, <S2, C2>)的数据项<S, C>，他们是否已经被传播到S3中了。
+
+换句话说，我们不希望存在一个S2中的数据项<St, Ct>，使得，WriteOrder(<St, Ct>, <S2, C2>)且<St, Ct> > <St, Cx> where <St, Cx> from S3
+
+实现上来说，我们可以简单的对比S2和S3的version vector，如果他小于S3肯定是没问题的，但是对于某一些服务器对应的项大于S3的version vector的，同时这个项是小于我们要传播的项的，我们就可以把他放到<S2, C2>前面，保证写操作的按序的
+
+对于存储对应的数据，可能要通过logging，或者让WID作为主键直接查找。logging更容易一些，但是需要我们做GC。什么时候GC也是一个要考虑的问题
