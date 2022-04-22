@@ -153,3 +153,13 @@ figure2列出了我们需要检测的几个现象。也就是要检测发生在T
 在一个task中，获得MVCC数据上的latch（一个transaction通常由多个task组成，应该就是对应的sql statement。为了防止race，就在操作的时候加上短期锁）
 
 提交的时候会进入一个临界区，首先拿到commitTimestamp，然后做validation，然后写redo log。最后的更新undo buffer中的timestamp可以通过原子操作在临界区外做。（所以这里的意思是还是只能一个一个的提交么？）他这个前后貌似不太一致，他前面说validation是可以并发的，但是后面说这个是在临界区的
+
+# Theory
+
+这里说了txn是并发的运行，但是提交是串行的
+
+![20220422140247](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220422140247.png)
+
+schedule的实例。其中图C值得仔细看一下。因为这里演示的是使用谓词的检查。我们用P和Q谓词读取了数据，在提交的时候就要验证最近的写入是否满足这两个谓词
+
+后面是一个证明，但是感觉这个算法还比较直观，就不贴了。
