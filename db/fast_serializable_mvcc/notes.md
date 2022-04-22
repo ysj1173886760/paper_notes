@@ -109,3 +109,47 @@ figure2列出了我们需要检测的几个现象。也就是要检测发生在T
 每一个关系表都会构建这样的一个predicate tree。不同的路径是OR连接。一个路径下由AND连接
 
 所以每一个版本都会去检查他们是否满足了PT的某一个分支
+
+## Garbage Collection
+
+每次提交之后，我们都会在最近提交的事务里确定最老的可见事务ID是多少，那么所有在他之前的事务就都可以从最近提交事务列表里移除。指向他们的undo buffer的指针也会被移除。undo buffer会被打上tombstone的标记。但是我们不能立刻释放undo buffer的内存，因为有可能有其他的事务有对他的引用（我们可以确定他看不到undo buffer里的内容，但是他需要这里面的信息来终止version chain的遍历）。
+
+但是如果已经标记的tombstone就可有直接终止了（那可能是先去检查一下tombstone，然后再访问）
+
+（个人猜想：可以通过维护undo buffer的refcnt来让最后一个人释放掉他，有点类似in-memory inode）
+
+## Handling of Index Structures
+
+当我们修改的元组涉及到索引的时候，对于关系表来说他会删除原本的版本并插入新的版本。而对于索引来说，他会存储原始的版本和新的版本。这样我们的索引中就存储了任何事务都可以看到的所有元组。
+
+对于检查一致性来说，比如主键约束。论文中的意思应该是对于uncommited的版本也会主动中止。因为我们在index中存储了所有的版本，所以当一个新的主键插入的时候他会检查索引，如果索引中有这个主键了，说明这个快照里就有，或者有一个未提交的主键，我们就会主动abort。理由是大多数的事务都会提交，所以事务将uncommited数据视为已经存在的版本。
+
+但是我感觉如果只是检查约束的话，我们可以为最后的检查阶段添加额外的谓词来实现。（可能是因为索引检查更快？不太清楚他们这里的tradeoff）
+
+## Efficient Scanning
+
+很多AP和TP的workload都依赖clock-rate scan performance。所以每次都对数据做可见性测试会导致性能下降
+
+通过synopses of versioned record positions来加速扫描
+
+在上面的figure1中，VersionedPositions就是这个摘要。他维护了具有版本的记录的位置的一个范围。
+
+由于我们会不断的进行GC，所以大多数的元组都没有其他的版本。比如figure1中的前5个元组，他们是没有其他版本的，所以我们可以不需要去进行额外的version check，以达到最大的扫描速度
+
+而对于已经修改的版本我们就需要根据version vector进行重建
+
+这里有一个奇怪的点：Again, a range for modified records is determined in advance by scanning the VersionVector for set version pointers to avoid repeated testing whether a record is versioned.
+
+我好奇这个范围不是一定被VersionedPositions确定了么？为什么还要再扫描VersionVector
+
+他提到了实践中两个versioned object的跨越是很大的。
+
+并且提前确定好versioned object的范围可以让我们在热点区域少查询VersionedPositions。（这块和上面的问题是一样的）
+
+## Synchronization of DataStructures
+
+简单提了一下怎么做的同步
+
+在一个task中，获得MVCC数据上的latch（一个transaction通常由多个task组成，应该就是对应的sql statement。为了防止race，就在操作的时候加上短期锁）
+
+提交的时候会进入一个临界区，首先拿到commitTimestamp，然后做validation，然后写redo log。最后的更新undo buffer中的timestamp可以通过原子操作在临界区外做。（所以这里的意思是还是只能一个一个的提交么？）他这个前后貌似不太一致，他前面说validation是可以并发的，但是后面说这个是在临界区的
