@@ -125,3 +125,91 @@ Removal指什么时候回收，和frequency的区别是frequency说的是时间�
 举个例子就是peleton，每个epoch他会识别出所有的过期的版本，然后后台线程会执行回收
 
 而Steam，则是在创建的时候就去检查是否可以回收，同时在commit的时候也会检查是否可以回收Undo buffer（他的细粒度检索我猜测应该是在遍历版本链的时候去检查，比如说打标记或者一边遍历一边剪枝。然后在最后提交的时候把那些过期的版本回收）
+
+# Steam Garbage Collection
+
+## Basic Design
+
+![20220423174650](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220423174650.png)
+
+用两个链表来追踪active和committed txns（HANA和Hekaton用的是reference-counted list和map）
+
+两个链表都是有序的，我们可以很快找到最老的active txn的timestamp
+
+并且当active txn的timestamp大于commit txn的时候，我们就可以回收commit txn的Undo buffer
+
+## Scalable Synchronization
+
+前面描述的方法虽然可以在常数时间内进行GC，但是他需要全局的txn list。从而导致无法scale
+
+Steam没有像Hekaton那样使用了latch-free txn map，而是用了一种不需要同步的算法
+
+这里还有一个点: For GC, we exploit the domain-specific fact that the correctness is not affected by keeping versions slightly longer than necessary-the versions can still be reclaimed in the "next round"
+
+Steam中每一个线程都维护了目前txn的不相交子集。每个thread只会把他的thread-local minimum共享出来（通过64bit atomic integer）。其他的线程就可以读这个值，从而获取全局最小值
+
+local minimum对应的是第一个活跃事务的时间戳。如果没有的话就设为一个极大值
+
+![20220423183531](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220423183531.png)
+
+要确定全局最小值，我们需要扫描每个线程的局部最小（但是我想这样不还是会受到多核缓存一致性的问题么？和latch-free没啥区别）
+
+## Eager Pruning of Obsolete Versions
+
+前面的方案只是避免了全局同步，但是没有处理long running txn的问题
+
+这里提出来Eager Pruning，可以移除掉所有的不需要的版本
+
+每个线程周期性的取出目前活跃事务的timestamp，并放到一个sorted list中
+
+每当一个线程遇到了版本链的时候，他就会根据下面这个算法去清理掉所有过期的版本
+
+![20220423185123](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220423185123.png)
+
+其实就是针对active txn去合并版本链。
+
+这里的意思就是找到第一个版本，然后对于所有的活跃事务，找到他看的版本。然后对于中间的版本（在figure1中就是中间无用的那些版本），我们会把它合并起来。但是注意这里只压缩了不属于attrs(visible)的版本
+
+![20220423185717](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220423185717.png)
+
+这个是一个剪枝的例子
+
+一个直观的问题就是这样剪枝不会影响其他的txn么？比如我们压缩了其他txn要看到的东西
+
+答案是不会，因为我们的合并是从最大到最小，所以第一个ai就是目前最大的txn，中间不会有其他的活跃事务，所以在figure6中v25会覆盖v50。并且在算法中他会把Vcurrent设成Vvisible，也就是上一次合并的版本。所以每次合并的时候，我们都会保证(Vcurrent, Vvisible)中间是没别人的
+
+这就带来一个新的问题，他们怎么保证active txn是及时更新的呢？因为这个list的周期性更新的。我感觉我们还需要维护一些最值信息（比如只合并这个sortlist中的最大和最小的版本）
+
+### Short-Lived Transactions
+
+对于没有长事务运行的workload来说，平常使用的GC就已经够用了，使用EPO还会额外的增加负担
+
+但是现实世界的workload是很难预测的，所以我们去tradeoff这里的effectiveness和overhead
+
+（这里的sorted list貌似是thread-local的）所以是每次运行transcation的时候去找活跃事务并创建sorted list
+
+这里的优化就是不是每次都重新创建sorted list，而是重用他们（即更新的频率更小，但是对于长事务仍然有效，因为相比之下我们的活跃事务列表的更新还是更快一些）
+
+但是貌似还是没说怎么取出活跃事务
+
+### HANA's Interval-Based GC
+
+这里说Steam中的prune发生在update的时候，貌似还是会出问题，如果我们不能保证有所有的活跃事务的信息的话
+
+![20220423195329](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220423195329.png)
+
+什么叫piggybacking the costs while the chain is locked anyway?因为一个线程在访问version chain的时候他需要latch住这个chain，所以我们无论如何也需要去latch住这个chain，就不会出现后台GC线程和worker线程争用的情况了
+
+## Layout of Version Records
+
+![20220423200234](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220423200234.png)
+
+对version records的设计
+
+这里提到了原子提交的事情，Version中有一个lock bit，用来保证提交是原子的（有点类似Hekaton）
+
+他这里有一个bulk-insert的优化，就不提了
+
+然后用AttributeMask可以加速我们检查一个attribute是否在另一个中。并且还节省了存储attributeID的空间
+
+这里的结构应该和HyPer是一样的，就是原始的表中有数据，然后一个指针指向version vector，表示他这次的操作
