@@ -180,6 +180,12 @@ local minimum对应的是第一个活跃事务的时间戳。如果没有的话�
 
 这就带来一个新的问题，他们怎么保证active txn是及时更新的呢？因为这个list的周期性更新的。我感觉我们还需要维护一些最值信息（比如只合并这个sortlist中的最大和最小的版本）
 
+我突然想明白了，每个线程当前运行一个txn，所以线程数就是active txn的数量。所以我们从每个线程那里拿当前他的active txn id，然后创建成一个链表就可以。这么想我们找的第一个版本应该是当前事务看到的第一个版本。否则可能有更新的版本在被使用。
+
+最准确的方法应该是每次latch住这个版本链的时候，拿到最新的活跃事务列表再去prune
+
+但是他是每次update的时候才会去prune，那么如果已经有了新的txn来了，他如果更新了我们要去更新的地方，那么他就会进行prune，而我们会abort。（所以当更新失败的时候去更新active txn list是一个合理的选择？）
+
 ### Short-Lived Transactions
 
 对于没有长事务运行的workload来说，平常使用的GC就已经够用了，使用EPO还会额外的增加负担
@@ -213,3 +219,12 @@ local minimum对应的是第一个活跃事务的时间戳。如果没有的话�
 然后用AttributeMask可以加速我们检查一个attribute是否在另一个中。并且还节省了存储attributeID的空间
 
 这里的结构应该和HyPer是一样的，就是原始的表中有数据，然后一个指针指向version vector，表示他这次的操作
+
+# Evaluation
+
+![20220424092102](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220424092102.png)
+
+他这个table4的东西比上面清楚多了，就讲的是具体的实现
+
+HANA中，整个GC的工作都是在后台进行的
+Hekaton中，后台线程负责更新全局最小值，并识别过期的版本。然后把任务分配给worker线程让他们去清理这些版本
