@@ -156,3 +156,25 @@ OpenBwTree用了一种去中心化的方法。
 这样其实是分散了争用。之前用的是计数器。这里是维护的本地的watermark，从而获得全局最小。然后我们回收小于全局最小的对象。并且这里的删除分摊到了每个线程中
 
 （思考，其实是一种去中心化的维护watermark的方法。因为在中心化的实现中，我们完全可以用一个sorted-list来维护当前的active-operation的epoch，每次结束操作就把他产生的garbage打上最新epoch的标记，然后把自己从sorted-list中移除。这样的话垃圾回收器只要读第一个节点就可以，但是对于注册这个操作来说，他可能会引起争用，同时lock-free的双向链表也不清楚有没有。所以这个方法是写慢，但是读快。而去中心化之后，每个人其实相当于都遍历了一遍链表才能获得global minimum，读虽然慢了，但是他的写很快，并且没有争用。这么想的话其实lsm tree也有这个思路，加快写（通过append only），但是代价就是读变慢）
+
+## Fast Consolidation
+
+![20220425180433](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220425180433.png)
+
+consolidation分为两个阶段，第一个阶段是复用之前的non-unique key的方法来找到那些元组被删掉了，那些被插入了。然后第二个阶段则是把插入的新元组和之前的老节点做一次2路归并，从而生成新的base-node
+
+insert record和delete record在作用于base node的时候，会存储一个offset字段，用来表示这次操作会作用到哪里。然后我们用Spresent和Sdeleted来将base node划分成若干个片段。再用这些片段和insert record做归并
+
+（我在想维护这些segment的overhead难道不大么，直接sort感觉会更好一些）
+
+## Node Search Shortcuts
+
+当节点很大的时候，我们一次二分搜索可能会跨越多个cache line，从而导致效率不高
+
+我们通过micro-indexing来减少节点内的搜索
+
+![20220425182052](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220425182052.png)
+
+这里是减少了最后的base node的扫描范围
+
+因为之前的insert以及delete record记录的都是当前的Key对应在base node的偏移量。所以当我们在路上比较的时候就可以顺便获取base node中值的范围。从而在最后一步实现快速的查找
