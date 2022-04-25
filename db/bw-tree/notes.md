@@ -57,5 +57,102 @@ BwTree借用了BlinkTree的设计，每个节点有两个入指针，一个是�
 
 当CAS失败的时候，这次操作就会重启。每次重启都会从树根开始重新遍历。虽然更复杂的重启协议是可能的，但是我们认为从树根开始遍历简化了实现。并且我们要遍历的节点很可能会在cache中
 
-他提了一点就是这里的Mapping Table只关注了BwTree的实现。实际上他也可以支持log-structured updates。（这里我不太明白，可能需要再去研究一下log-structured相关的细节）
+他提了一点就是这里的Mapping Table只关注了BwTree的实现。实际上他也可以支持log-structured updates。（这里我不太明白，可能需要再去研究一下log-structured相关的细节。他的意思可能是LSM中一个数据会在多层出现，我们通过只修改间接层从而可以直接修改多层数据）
 
+## Consolidation and Garbage Collection
+
+当delta chain增长的时候，worker每次来就需要重新遍历并重建当前的状态。为了防止过长的delta chain，worker会周期性的压缩delta chain并重组成一个新的base node。
+
+在压缩的最开始，线程首先把logical node的base node复制到他的私有内存中，然后开始应用delta chain。接着他会更新MappingTable中的指针，指向新的logical node。最后当所有的线程都离开老的节点的时候，我们就可以回收他的内存
+
+## Structural Modification
+
+和B+树一样，Bw树也会出现overflow或者underflow的情况。从而导致了splitting以及merging
+
+核心思想就是利用特殊的delta record来表示内部结构的变化
+
+SMO（structural modification protocol）的操作有两个阶段，一个是logical phase，用来追加特殊的delta record来通知其他的线程这里会有一个SMO，以及一个physical phase，用来实际执行SMO（即split或者merge，然后通过CAS来替换掉老的节点）
+
+尽管BwTree是lock-free的，但是如果CAS失败的话线程仍然无法make progress（比如在这个两阶段操作中，我们不能假设是同一个线程在做，否则就会阻塞其他的线程的进度）。一个解决这个的方法就是合作执行multi-stage的SMO，也被称为help-along protocol。线程必须在节点被遍历之前帮助完成SMO的未完成阶段
+
+（我怎么感觉他这块说的都好迷幻，应该看一下BwTree之前的文章）
+
+# Missing Components
+
+## Non-unique Key Support
+
+在遍历的过程中，BwTree会停在第一个匹配搜索键的地方。但是这样是无法支持non-unique key的
+
+我们在遍历的时候维护两个集合，$S_{present}$和$S_{deleted}$。$S_{present}$ contains the values that are already known to be present. $S_{deleted}$ contains the value that are known to be deleted
+
+如果发现了一个insert record，键为K，值为V，并且V不属于$S_{deleted}$，我们就会把V加入到$S_{present}$中。
+
+如果发现了delete record，并且V不属于$S_{present}$，他就会把V加入到$S_{deleted}$中
+
+更新操作是通过删除后插入来完成的。当遇到最后的base的时候，最终构建出的节点就是$S_{present} \cup (S_{base} - S_{deleted})$
+
+![20220425143451](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220425143451.png)
+
+这里的查找是针对叶子节点单个K的，不是这个K的record会被忽略掉
+
+## Iteration
+
+直接在BwTree上进行遍历是非常困难的，因为我们很难定位当前迭代器的位置。并且还需要处理SMO以及并发插入删除的问题
+
+我们的迭代器不直接放在树节点上。每个迭代器都会维护一个只读的logical node的副本。
+
+当迭代器移动的时候，如果当前的副本用完了，我们就会通过low key或者high key来重新遍历一次
+
+## Mapping Table Expansion
+
+每个线程都会访问Mapping Table，所以不让他成为bottleneck是很关键的
+
+Mapping Table就是一个数组。动态增长的方法就是使用Lazy allocation。我们提前分配好虚拟空间，当实际使用的时候再分配物理内存
+
+而对于Shinking的情况，没有很好的方法，我们只能阻塞住worker thread，然后重构索引
+
+（我在想他们的logical id是怎么复用的？用free list吗？个人猜想是先放到free list中，但是不用。每过一段时间冻结free list，然后再用free list中的内容）
+
+# Component Optimization
+
+## Delta Record Pre-allocation
+
+Delta Chain in Bw-Tree is a linked list of delta records that is allocated on the heap. 遍历这个Delta chain会变得很慢，因为局部性很差。并且大量的并发内存分配会导致分配器的争用，从而导致了bottleneck
+
+我们会在base node中提前分配delta record
+
+![20220425153903](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220425153903.png)
+
+base node会在高地址的边缘。而delta record会从高到低进行分配（利用pre-fetch）
+
+每个链也会维护一个allocation marker，指向的是最后一个delta record。当worker需要一个slot的时候，他就会减少这个marker（和栈类似），如果预先分配好的区域满了，他就会触发压缩操作
+
+delta record不会删除，所以没有free-list的问题。图中的交错是因为并发的操作导致的，比如第一个线程先分配了空间，但是是后面才append到链中（如果这里失效了，他会放弃掉这段内存吗？因为前面说了当CAS失败的时候要重新遍历，但是重新遍历有可能我们就不会回到相同的node了，是不是只有split/merge的情况才需要重新遍历呢？）
+
+## Garbage Collection
+
+之前的BwTree用的是Epoch-based GC，每过一段时间他会在一个全局的链表上追加一个epoch object。每个线程在访问索引之前必须先在epoch object上注册自己
+
+让线程结束操作以后，他就会把自己从epoch object上移除。所有的删除操作都会被加入到当前epoch的garbage list中，当所有的线程都离开这个epoch的时候，我们就可以安全的回收garbage list中的对象
+
+（这样可以安全的保证吗？我感觉在这个操作结束之前的epoch都可能出问题，而不是只有开始的epoch。貌似文章中说了，在操作完成的时候，把删除的对象加入到当前epoch，而不是他进入的那个epoch，所以应该没问题。我们只要保证epoch是按序删除的就行）
+
+（第二个思考是他们为什么回避对单个node进行refcnt呢？这样最后一个人负责删除他就好了，可能是为了防止写元数据导致的cache invalidation）
+
+![20220425160520](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220425160520.png)
+
+这种中心化的方法会导致scalability的问题。因为cache coherence这时候会变成瓶颈
+
+OpenBwTree用了一种去中心化的方法。
+
+![20220425161132](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220425161132.png)
+
+索引自己维护了global epoch。每个线程自己维护了本地的epoch，以及他删除的对象列表。
+
+在开始操作的时候，线程会把当前的全局epoch复制到本地的epoch中。当他完成操作的时候，他会再次将全局epoch复制到本地epoch中，并且把garbage打上最新的global epoch的标记（表示所有小于这个epoch的线程都有可能访问到他）。然后开始GC。他会收集其他线程的local epoch，并且删除所有小于最小local epoch的那些对象。
+
+线程的local epoch表示的就是这个线程目前的操作正在那个epoch。如果所有人都高于garbage的epoch，就可以安全的回收
+
+这样其实是分散了争用。之前用的是计数器。这里是维护的本地的watermark，从而获得全局最小。然后我们回收小于全局最小的对象。并且这里的删除分摊到了每个线程中
+
+（思考，其实是一种去中心化的维护watermark的方法。因为在中心化的实现中，我们完全可以用一个sorted-list来维护当前的active-operation的epoch，每次结束操作就把他产生的garbage打上最新epoch的标记，然后把自己从sorted-list中移除。这样的话垃圾回收器只要读第一个节点就可以，但是对于注册这个操作来说，他可能会引起争用，同时lock-free的双向链表也不清楚有没有。所以这个方法是写慢，但是读快。而去中心化之后，每个人其实相当于都遍历了一遍链表才能获得global minimum，读虽然慢了，但是他的写很快，并且没有争用。这么想的话其实lsm tree也有这个思路，加快写（通过append only），但是代价就是读变慢）
