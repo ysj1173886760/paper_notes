@@ -178,3 +178,31 @@ insert record和delete record在作用于base node的时候，会存储一个off
 这里是减少了最后的base node的扫描范围
 
 因为之前的insert以及delete record记录的都是当前的Key对应在base node的偏移量。所以当我们在路上比较的时候就可以顺便获取base node中值的范围。从而在最后一步实现快速的查找
+
+# Evaluation
+
+这里写几个我感觉比较有意思的点吧
+
+![20220426094846](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220426094846.png)
+
+从这个图大概可以看出来，BwTree的效率不高可能是因为访存太多，也就是memory footprint太大导致的。
+
+![20220426095211](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220426095211.png)
+
+这里也显示了，在HC（high contention）的情况下，abort rate是1000%，所以一次操作会abort10次才能成功，所以导致了大量的footprint。反而降低了lock-free的优势。因为本身lock-free的算法就是在高争用情况下保证可以make progress
+
+![20220426095445](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220426095445.png)
+
+![20220426095737](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220426095737.png)
+
+表现最好的ART拥有相当高的局部性
+
+这样看起来是BwTree的结构导致的他表现的不好，比如更多的Branch，更多的预测失败等
+
+所以可能BwTree更适合在flash中，而非memory中。因为他的优势在于append-delta，所以cache invalidation的优化不能弥补更多的memory footprint带来的开销。但是flash中比较偏向这种结构，也就是log-structured形式。所以可能BwTree在flash中表现的会更好
+
+最后他有一个performance decompisition，基本上把BwTree的feature都关掉，然后比较性能
+
+但是结果是即便把feature都关掉，BwTree还是比B+Tree慢一些。原文说: Even Read-only operations perform considerable bookkeeping to maintain the consistency of the tree, limiting its performance.
+
+这里我不太明白他的都维护了什么东西，但是可能就是因为为了latch-free所维护的各种信息吧，导致了高开销
