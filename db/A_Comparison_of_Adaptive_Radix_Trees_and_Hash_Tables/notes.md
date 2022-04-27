@@ -98,3 +98,16 @@ i表示的是第i次探测。二次探测的优势就是（1）容易实现（2�
 当table多的时候空间利用率高，但是效率会很低。table只有两个的时候效率高，但是空间利用率低
 
 cuckoo hashing的好处就是我们查询的次数与load factor无关。最多只有两次。但是缺点就是对于哈希函数很敏感。
+
+## Hash functions
+
+Multiplicative hashing:
+
+![20220427180519](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220427180519.png)
+
+这个哈希函数是非常快的。我们可以在乘法之前就mod 2的w次幂，并且除法可以简单的通过右移来实现。并且他还有理论保证，两个数的冲突率是：
+![20220427180727](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220427180727.png)
+这个冲突率是理想的冲突率的2倍（应该算是非常小的了）
+
+虽然Murmur hash相当robust，但是会带来巨大的performance degradation。我们认为multiplicative hashing是足够robust的，并且有很好的performance
+
