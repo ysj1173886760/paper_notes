@@ -128,3 +128,117 @@ FM利用了10个直方图：
 这里的更新，当从3到16的时候，empty slot是向前，所以更新的是udf和utf。否则就是udb和utb
 
 虽然示例是一个列，但是我们可以把它放入多个列（但是只能根据一个排序）。因为FM不会在意他内部具体存储的数据（也就是不在乎一个数据项内存的都是什么，只关注block的访问模式）
+
+![20220428184617](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428184617.png)
+
+我们也可以从现有的access pattern中学习FM。我个人感觉就是有了访问每个block的分布了，然后把它转换成直方图而已
+
+## Cost Functions
+
+假设数据集中有M个值，block size为B，则我们最多可以有M/B=N个partition
+
+假设访问block有四种IO方式，随机读RR，随机写RW，顺序读SR，顺序写SW
+
+### Range Query
+
+他这里给了个例子我觉得还挺有意思的
+
+![20220428191003](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428191003.png)
+
+这个图中，每次我们的RQ尝试从第三个block开始读的时候，如果P1没有设置（在这里没有分区），那么我们就需要额外读第二个block，如果P0也没有设置，那我们就需要额外读第一个block。而如果P1设置的话，我们就不需要进行额外的读，最多读一个block就可以
+
+那么一个block作为开始块进行访问的代价就是
+![20220428191258](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428191258.png)
+
+其中第一项表示的是第一次随机读到这个块。而第二项则表示的是由于没有分区导致的额外的block reading，不过这些是顺序读
+
+第二项是累乘的，比如对于第5个block，他前面的就是(1-p4) + (1-p4) * (1-p3) + (1-p4) * (1-p3) * (1-p2)这样的。因为只要后面的分区了，前面就不会有影响
+
+（从这里看大概可以明白他的思路，以block为粒度来分区，然后根据每个block分区或者不分区来计算操作的代价。变量只有每个block是否分区，就变成了01规划，最后我们可以得到一个好的分区方案）
+
+对于block作为结束块的代价是类似的
+![20220428192253](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428192253.png)
+
+也就是说我们只需要往后找就可以，但是这里最后一块也是顺序读
+
+对于中间块的访问，则是顺序读
+![20220428192500](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428192500.png)
+
+所以总和起来，所有的RQ的代价就是
+![20220428192638](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428192638.png)
+
+### Point Query
+
+![20220428192807](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428192807.png)
+
+有了前面的例子这里就会容易很多。fwd_read就是向前，也就是下标增大的方向额外读取的block，bck_read则是向下标减少的方向额外读取的block
+
+所以这里代表的是找到partition是一个RR，然后读完是若干个SR
+
+### Inserts
+
+![20220428193224](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428193224.png)
+
+因为我们需要从最后面引入一个empty slot，所以我们的后面每有一个partition都会导致一次额外的交换，即读第一个元素，写入到最后一个元素的后一个位置，这里的加一指的是最后一个分区的读写（他的最后一块应该没有标志分区）
+
+### Deletes
+
+![20220428194438](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428194438.png)
+
+delete和insert十分类似。不同的点就是我们需要一次点查询来得到要删除的数据
+
+这里和insert不同的地方就是我们少一次RR，因为删除的时候直接覆盖就行，不需要知道之前的值的内容。（其实代价算在了点查询中）
+
+![20220428194809](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428194809.png)
+
+### Updates
+
+很多的系统中，update是delete加insert的结合。一个更有效的措施是我们可以直接把ripple从source移动到dst，而不需要放到最后
+
+对于第一个partition来说，也就是删除的那个partition，我们需要访问两个block（最后一个和删除的那个）
+
+假设现在的一个update操作会把一个在block i中的值删除，然后插入到block j中。首先需要做一次点查询。然后一次删除，把新出现的empty hole移动到分区的最后一个。代价则是
+![20220428195452](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428195452.png)
+即先删除，然后读最后一个元素，然后写入到hole中（为什么不盲写呢？）
+然后我们要考虑把empty hole移动到block j中。他们之间的分区数是Pi + ... Pj-1，也就是trail_parts(i) - trail_parts(j)
+
+![20220428200047](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428200047.png)
+
+这里就是从左到右的代价。开始点需要一次点查询，然后移动hole。然后我们需要移动若干个分区到j中，最后一次插入（其实这里多统计了一个读，因为最后的分区就是j所在的分区，他其实只需要一次写入就可以，不需要读）
+
+对于反过来的方向，操作则是一样的
+![20220428200516](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428200516.png)
+
+![20220428201224](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428201224.png)
+
+最后把他们拆开看，最后的开销取决于FrequencyModel和PartitionStrategy，分别是(fixed_term, bck_term, fwd_term, parts_term)以及(bck_read(i), fwd_read(i), trail_parts(i))。也就是说我们的cost function是由access pattern和分区策略共同决定的（而access pattern由workload和data distribution共同决定）
+
+## Cost Model Verification
+
+每次部署的时候，我们需要确定有关读写的参数。我们通过一个micro-benchmarking来确定这些参数。并且通过插入和单点读操作就可以足够确定这些参数了。因为他们包含着模型中主要的两个代价函数：（1）后续的分区数，（2）每个分区的大小
+
+![20220428202236](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428202236.png)
+
+在micro-benchmark中有若干个partition，并且分区的大小随指数增长（我好奇为什么insert在后面的partition开销这么大呢？我们应该只需要一次写才对）
+
+这里显示了实际的开销和模型给出的结果的图，可以看出预估的效果
+
+具体的操作应该就是线性回归，让model去拟合真实值
+
+他原文中也说了cost和trailing partition有线性关系，但是这里为什么ID越大延迟越高呢？可能是ID越大越靠前？
+
+## Considering Ghost Values
+
+最后需要考虑Ghost value了
+
+ghost value就是没有被移动到最后面的empty slot，他是对于memory utilization和data movement的trade off
+
+对于每次的插入和更新，ghost value可以避免使用ripple来获得empty slot
+
+![20220428204011](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220428204011.png)
+
+ghost value有一个总体的数量（意思是一个chunk共用一堆ghost value）
+
+这里的dm_part就表示第i个block中的insert和update引起的ripple（不算delete的目的可能是因为当用了ghost value后，delete就不会引起ripple了？）
+
+然后我们根据权重来分配ghost value的slot。具体的实现的话，应该就是只有分区内部才考虑ghost value，其他分区应该不会向这个分区要ghost value（否则决策点就太多了），相当于给这个分区一些弹性，让他可以处理更新的操作
