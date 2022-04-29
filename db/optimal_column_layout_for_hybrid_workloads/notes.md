@@ -242,3 +242,22 @@ ghost value有一个总体的数量（意思是一个chunk共用一堆ghost valu
 这里的dm_part就表示第i个block中的insert和update引起的ripple（不算delete的目的可能是因为当用了ghost value后，delete就不会引起ripple了？）
 
 然后我们根据权重来分配ghost value的slot。具体的实现的话，应该就是只有分区内部才考虑ghost value，其他分区应该不会向这个分区要ghost value（否则决策点就太多了），相当于给这个分区一些弹性，让他可以处理更新的操作
+
+# Optimal Column Layout
+
+他这里说了Pn-1是固定为1的，那可能前面有些地方的推断是错的
+
+和上面说的一样，最后就转化成了一个优化问题，我们需要找到最优的分区位置
+
+![20220429093033](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220429093033.png)
+
+由于之前的式子中，有P之间的乘积，无法通过线性的求解器来求解，因为引入了高次项。所以这里用新的项替换了之前的连乘，并通过加入约束来保证他和之前的项表达的是一致的。
+
+而这里y就表示的是连乘，他的取值范围仍然是0和1,含义大概是从j到i - 1有没有分区。
+
+他还给出了上面提到的SLA
+![20220429093629](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220429093629.png)
+保证更新不超过一定的延迟
+
+![20220429093652](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220429093652.png)
+保证读不超过一定的延迟。MPS表示的是最大的分区大小。也就是保证每过MPS个block，最小有一个1
