@@ -240,3 +240,5 @@ off-row table是append only，所以我们可以跟踪额外的信息从而实�
 CTR通过一个哈希表来跟踪每个页中的off-row version，我们只保存每个页的最大的txn id。当这个页的最大txn id已经小于watermark的时候，我们就可以直接回收这个页。这里注意watermark由活跃事务和abort事务共同组成，因为我们需要已提交的版本来做Logical Revert
 
 后面就是一点小优化。
+
+最后的一个思考，CTR实际上是利用了MVCC的特性，将版本信息和Log结合到了一起，从而可以让我们只通过修改txn state来实现批量提交的目的，本质上是批量的将最新的版本通过txn state来删除掉。所谓的SLog实际上就是不能够通过MVCC来处理的信息，我们单独拿出来通过日志来进行redo/undo。所以可以看成是MVCC附带Log信息，然后独立处理非MVCC的数据的一个机制。
