@@ -14,6 +14,6 @@ The reading list that i'm referring:
 [PingCAP](https://github.com/pingcap/awesome-database-learning)
 [AwesomeDistributedSystems](https://github.com/theanalyst/awesome-distributed-systems)
 
-If you have questions while reading those paper, welcome to contact me and have a discussion.
+If you have questions while reading those paper, feel free to contact and have a discussion with me. I'm interested in digging details on those papers with others.
 
 Happy Reading!
