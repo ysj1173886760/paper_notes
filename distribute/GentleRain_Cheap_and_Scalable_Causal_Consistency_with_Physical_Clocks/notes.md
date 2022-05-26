@@ -72,3 +72,65 @@ Client States：
 Server States：
 每一个服务器会维护一个version vector。VV[i]表示当前服务器已经从副本i处接受了直到VV[i]之前所有的更新
 
+定义LST，local stable time为服务器上的VV的最小值
+
+GST，global stable time为相同data center上的最小LST
+
+Item Version：每一个数据都有多个版本。通过{k, v, ut, sr}来表示一个版本。其中kv为键值，ut为update time，是源服务器创建这个版本的时间。sr为source replica，表示源服务器的replica id
+
+## Protocol
+
+![20220526124120](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220526124120.png)
+
+![20220526124332](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220526124332.png)
+
+![20220526132804](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220526132804.png)
+
+分片之间独立的同步他们的时间戳。通过Version Vector来记录其他分片中的时间。最小的时间记为LST，即local stable time，表示所有小于这个时间的在这个分片上的更新，已经稳定了。
+
+数据中心内部的分片会相互交换信息，统计出所有分片中最小的LST，作为GST。表示任何的更新，如果他的时间戳小于GST，则这个更新对用户可见。（因为在所有分片上的所有副本的时间都已经大于这个时间了，前面的算法可以保证一个更新的时间戳一定大于所有他依赖的更新的时间戳，所以可以保证因果一致性）
+
+## Reads of Multiple Items
+
+![20220526141715](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220526141715.png)
+
+核心就是确定GST，然后在所有分区执行读就可以
+
+![20220526141733](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220526141733.png)
+
+ROT要保证单调读，所以他需要保证之前读到的那些数据被同步到其他数据中心，并更新了GST后才能读。
+
+所以他会等GST更新到DT，然后再执行algorithm3
+
+## Conflict Detection
+
+更新冲突的情况下，我们需要外部逻辑来处理这个冲突。
+
+GentleRain的冲突检测有点类似Raft，即新到来的Update会保存他前一个版本的信息。在install new version的时候，他会检查新的Update和前一个版本和当前版本链是否对应。如果出现冲突，则需要外部逻辑来处理。
+
+## Efficient Global Stable Time Derivation
+
+相同数据中心的服务器会周期性的交换他们的LST来计算GST。
+
+全体广播的消息复杂度是n方的，所以当数据中心内的分区数很多的时候广播的方法会成为瓶颈
+
+通过树形结构来聚合GST
+
+叶子节点会发送LST给他的父节点，最终GST会聚合到根节点。然后再重新下发
+
+消息的数量很小，但是需要log级别的RTT（数据中心内的延迟很小，相较于数据中心之间的Version Vector的聚合来说开销很小。）
+
+# Discussion
+
+## Why Physical Clocks
+
+因为lamport clock只有在接受到消息的时候才会增加他的值。从而可能导致不同服务器之间的clock移动的速率差距较大。而GST跟踪的是全局的最小时间，这种情况下可能导致GST推进的速度很慢。
+
+通过物理始终可以避免不同服务器之间的时钟偏差较大。
+
+## Throughput vs Latency Tradeoff
+
+在现有的系统中，一个更新在远端变为可见的时间是消息从本地传输到远端的时间加上交换依赖检查消息的时间。而后者是在数据中心内部，所以可以简略的认为是本地到远端的时间。
+
+然而在GentleRain中，延迟有很多的因素。首先就是距离最远的数据中心的传输时间。因为GentleRain要求所有的数据都到了所有的replica以后才能被客户看到。第二点，数据中心之间可能存在时钟漂移。第三，树形聚合协议需要计算GST的时间。最后，当请求数量少的时候，我们需要靠heartbeat protocol来传播时间。总体的时间也是接近于最远数据中心之间的传输时间。
+
