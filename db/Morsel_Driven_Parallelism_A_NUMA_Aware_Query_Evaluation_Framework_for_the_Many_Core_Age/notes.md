@@ -78,3 +78,34 @@ morsel-driven execution会被QEPobject来控制。他会把executable pipeline�
 和火山模型不同的是morsel-driven的执行中，pipeline不是独立的（pipeline segment不同并且有依赖）。morsel-driven的pipeline会共享数据结构，从而需要一些同步手段。还有就是不同的pipeline segment的线程数不同，并且pipeline segment内部的线程也可以变化。
 
 （这个感觉有点像数据并行和模型并行，数据并行不需要考虑依赖和同步，数据与数据之间是独立的。而模型并行则需要考虑依赖性，并且内部也会有数据的并行。但是这篇文章的重点不在这里，而是在细粒度的执行，NUMA-aware的scheduling，以及共享的数据结构）
+
+# Dispatcher: Scheduling Parallel Pipeline Tasks
+
+dispatcher负责控制以及分发计算资源给每个pipeline。我们通过将task分配给每个worker来实现这一点。我们会为每个硬件线程（逻辑核我猜测）绑定一个对应的worker。因此查询的并行度不由创建或者终止线程来实现，而是通过将分配任务来实现。
+
+一个task是由一个pipeline job，以及一个morsel组成的。任务的抢占只有在morsel的边界处才会出现，即执行的粒度是morsel，从而可以不需要引入额外的中断机制。
+
+分配task给worker的主要目标为：
+1. Perserving locality by assigning data morsels to cores on which the morsels are allocated
+2. Full elasticity concerning the level of parallelism of a particular query
+3. Load balancing requires that all cores participating in a query pipeline finish their work at the same time in order to prevent fast cores from waiting for other slow cores.
+
+![20220601141728](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220601141728.png)
+
+dispatcher维护了一个链表，里面存储了那些依赖已经被满足的pipeline job。前面提到过QEPobject负责跟踪pipeline的依赖，所以他负责将可执行的pipeline发给dispatcher。
+
+## Elasticity
+
+通过dispatching jobs a morsel at a time来实现调度的elasticity。比如我们有一个长的查询Ql在运行，当出现了一个更加高优先级的查询Q+的时候，我们可以降低Ql的并行度，并优先处理Q+，当Q+执行结束后，我们就可以回来提高Ql的并行度。
+
+每个pipeline job都会维护一个pending morsels的list。他的这个list是每个core单独维护的，Core0上存的就是core0的morsel。而不是有一个中心化的结构来保存所有的morsel。
+
+## Implementation Overview
+
+实现上，我们并不是在每个socket上都执行一个dispatcher thread，而是让core在需要morsel的时候去自己执行dispatcher的code。
+
+通过lock-free的数据结构来减少争用（lock-free应该是减少等待而不是减少争用）
+
+数据之间的依赖的处理，即QEPobject是通过一个状态机来实现的（他这里说的是passive state machine，我个人感觉就是拓扑排序的实现)。当我们的dispatcher发现pipeline job执行完的时候，他就会通过QEPobject来尝试找到新的pipeline job。和dispatcher一样，代码也是在worker上执行的。
+
+（这里说白了就是没有真的dispatcher，就是socket上有对应的pipeline job列表，以及morsel列表。然后worker自己去拿，或者通过QEPobject去放新的pipeline job。）
