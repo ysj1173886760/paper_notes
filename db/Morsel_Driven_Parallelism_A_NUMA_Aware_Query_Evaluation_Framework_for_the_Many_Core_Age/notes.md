@@ -109,3 +109,35 @@ dispatcher维护了一个链表，里面存储了那些依赖已经被满足的p
 数据之间的依赖的处理，即QEPobject是通过一个状态机来实现的（他这里说的是passive state machine，我个人感觉就是拓扑排序的实现)。当我们的dispatcher发现pipeline job执行完的时候，他就会通过QEPobject来尝试找到新的pipeline job。和dispatcher一样，代码也是在worker上执行的。
 
 （这里说白了就是没有真的dispatcher，就是socket上有对应的pipeline job列表，以及morsel列表。然后worker自己去拿，或者通过QEPobject去放新的pipeline job。）
+
+当某一个socket的job都完成了，他就会尝试从其他的socket去steal work，从而防止闲置的线程。
+
+并且这个模型还可以提供很好的方法来取消查询。比如当我们事务abort，或者内存耗尽等问题出现的时候，我们可以不去让OS杀掉对应的线程，而是可以标记这个query。当worker发现这个query被取消了，他就可以不从里面获取morsel。这个方法可以让worker自己去做clean up的工作，而不需要引入额外的机制（比如RAII，杀掉线程的时候释放线程申请的资源）
+
+## Morsel Size
+
+Morsel size不是一个很关键的因素，和Vectorwise的执行不同，我们不要求morsel可以放入缓存中，他们只是一个用于调度的任务单元而已。在选择的时候，只要保证他们足够大可以均摊调度开销就可以。
+
+系统中的shared-datastructure，也就是dispatcher，不容易成为瓶颈。因为我们最开始会为每个线程分配他们的range，只有当他们本地的range使用完之后线程才会尝试steal其他的range，从而导致一定的争用。同时如果有多个任务同时执行的时候，这个效果会变得更小（因为我们更不容易去steal work）。并且我们可以通过增加morsel size来减少对共享数据结构的访问。只要有足够的query，增加morsel size就不会影响整体的吞吐量。
+
+# Parallel Operator Details
+
+我们需要保证每个算子都是可以并行执行的。这一节则是讨论并行算子的实现
+
+## Hash Join
+
+前面已经提到过，hash join有两个阶段。第一阶段是将输入的数据物化到thread-local area中。第二阶段则是通过CAS将tuple的指针插入到哈希表中
+
+文章提到了一些选择single-table hash join的优点。这里就不提了。
+
+## Lock-Free Tagged Hash Table
+
+他的hashtable有一个优化就是在指针上存了一个filter。64位中有16位的filter，以及48位的指针。
+
+![20220601212807](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220601212807.png)
+
+在指针上存了一个bloom filter，然后通过bloom filter可以减少cache miss
+
+（我好奇他都已经确定了哈希表的大小了，为什么还要用链式哈希，而不是用开放寻址）文章中他说因为开放寻址法需要把tuple保存到哈希表中，而链式的则保存指针就好。并且链式的缺点是缓存命中率低，也通过filter解决了。
+
+这里有一个很有意思的点。实现的时候是通过mmap来分配哈希表的空间的。并且由于OS会进行lazy allocation，只有第一次写入才会真正的分配空间。带来两个好处，一就是我们不需要手动初始化哈希表，让OS在分配页的时候帮我们初始化即可。二就是哈希表会适应性的分布到每个NUMA-node中。因为当第一个线程写入的时候，对应的页会被分配到这个线程所在的节点上。所以如果有很多线程在构建哈希表的话，哈希表会在各个node中交错分布（并且node访问的越多，他就越可能是第一次访问数据，从而拥有更多的local page）。当只有一个node的时候，哈希表就会整个坐落于这个node上。
