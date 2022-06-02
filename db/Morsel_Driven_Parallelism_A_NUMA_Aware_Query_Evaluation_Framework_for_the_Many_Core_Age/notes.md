@@ -141,3 +141,43 @@ Morsel size不是一个很关键的因素，和Vectorwise的执行不同，我�
 （我好奇他都已经确定了哈希表的大小了，为什么还要用链式哈希，而不是用开放寻址）文章中他说因为开放寻址法需要把tuple保存到哈希表中，而链式的则保存指针就好。并且链式的缺点是缓存命中率低，也通过filter解决了。
 
 这里有一个很有意思的点。实现的时候是通过mmap来分配哈希表的空间的。并且由于OS会进行lazy allocation，只有第一次写入才会真正的分配空间。带来两个好处，一就是我们不需要手动初始化哈希表，让OS在分配页的时候帮我们初始化即可。二就是哈希表会适应性的分布到每个NUMA-node中。因为当第一个线程写入的时候，对应的页会被分配到这个线程所在的节点上。所以如果有很多线程在构建哈希表的话，哈希表会在各个node中交错分布（并且node访问的越多，他就越可能是第一次访问数据，从而拥有更多的local page）。当只有一个node的时候，哈希表就会整个坐落于这个node上。
+
+## NUMA-Aware Table Partitioning
+
+最简单的分区方法就是用round-robin。
+
+一个好一些的方法就是基于一些比较重要的属性来做哈希分区。这样的话在我们做join的时候，能够join的元组通常是在同一个socket上的。所以可以带来更少的跨socket的通信。
+
+同时这个哈希函数也会被应用到哈希连接中哈希表桶的位置的最高位。（所以我猜测应该是哈希表的分布和数据的分布是相同的，这样查询哈希表的时候也是NUMA-Aware的）
+
+这种分区方法会对我们的morsel-driven执行模型有好处，但并不是决定性的。因为本身的表扫描就具有NUMA-locality，输出的结果也是具有局部性的。上面的分区方案的作用只是增强在连接时候的性能，而不会影响其他地方。
+
+## Grouping/Aggregation
+
+在做aggregation的时候，如果我们只有很少的几个组，那么聚合就会非常快，因为缓存命中率高。但是当组很多的时候，就会出现很多的cache miss，从而导致性能降低。
+
+![20220602090852](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220602090852.png)
+
+算法分为两个阶段。第一阶段是thread-local pre-aggregation
+
+先在本地做一个小的哈希表，对应图中就是ht。在本地将数据进行分区，得到若干个partition。
+
+第二阶段就是每个线程扫描其他的partition，然后将他们聚合到本地的哈希表中。这里的意思应该是一个线程负责一个或者多个group，然后扫描其他线程的partition。从而得到自己负责的group的结果。
+
+当一个partition处理完成后，会立刻被推到下一个算子中，这样他更有可能是fit-in-cache的。
+
+（有点类似分布式的aggregation，先做本地然后再去交换数据）
+
+和join不同的是聚合操作必须要所有的数据都输入后才能有输出。所以选择了用分区的方法。而join则是可以pipeline的，所以用一个哈希表去检查是否可以连接就可以。
+
+## Sorting
+
+![20220602094728](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220602094728.png)
+
+首先先执行local sort，或者local top-k
+
+每个线程首先计算local separator。然后为了防止分布偏斜的情况，所有的线程的local separator会被结合起来，并计算global separator。
+
+得到了global separator后，我们找到具体的separator的index，并通过这些index可以得出最终数组的具体分布，然后我们就可以直接把数据拷贝过去而不需要任何的同步。
+
+比如figure9,我们有3个worker，那么就需要将数组分为三段做并发的merge。每个worker挑出两个local separator，然后合并成2个global separator。如图所示，三个数组的第一段会被红色的worker合并，第二段会被绿色的worker合并，第三段则是蓝色worker。这样worker之间就不需要任何的同步。（但是缺点就是worker越多，每个线程所访问的远端内存也就越多，可能导致局部性比较差）
