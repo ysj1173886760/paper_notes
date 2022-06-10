@@ -127,3 +127,59 @@ scan sharing可以让我们共享移动数据的开销。但是多个query会增
 ![20220610105314](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610105314.png)
 （这么看他认为评估谓词是一个固定的时间）
 
+## Modeling In-Memory Secondary B-Trees
+
+Selects Using a Secondary Index：
+B+Tree作为二级索引的时候，叶节点存储的就是rowID。
+我们也可以直接扫描叶节点上的值来达成sequential scan的效果。因为B+Tree的叶子之间有链接。
+
+Modeling Secondary Index Scan：
+
+在index scan中有这么几个步骤。首先我们遍历到在请求的范围中的第一个叶节点。然后遍历叶节点并读取数据。最后我们写入结果。（如果只需要二级索引上的列我们就不用再次根据rowID去读数据，否则就需要根据rowID再去定位数据）
+
+Tree Traversal：
+找到第一个叶节点的开销为：
+![20220610111306](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610111306.png)
+
+b为fanout，也就是一个节点内部的kv对的数量。
+
+平均我们需要读取一半的键来找到需要的键。这里是假设结点内的sequential scan。
+
+每次读都是缓存命中的访问，加上一个谓词评估的时间。第一次的访问则是一个random access，也就是Cm。
+
+Leaves Traversal：
+遍历叶结点是随机访问。我们一共有N/b个叶节点。再乘上选择率就是需要访问的叶节点的个数。
+
+![20220610151623](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610151623.png)
+
+Data Traversal for Secondary Indexes：
+这个是读取叶节点上的rowID数据，是顺序遍历。
+![20220610151720](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610151720.png)
+aw + ow就是一个row需要的大小。乘上N就是叶节点数据的大小。然后再除以bandwidth（这个感觉应该和sequential scan的bandwidth一样）
+
+Result Writing：
+写结果的开销和之前顺序扫描中的是相同的
+![20220610153626](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610153626.png)
+
+Sorting the Result Set：
+基于rowID进行sort。每次访问都是一个cache hit，因为我们刚刚把它写入到result set中
+![20220610153846](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610153846.png)
+
+虽然sort的独立的，但是如果我们需要让他和full scan对比的话是必要的。并且如果在query plan中，index scan的下一步是tuple reconstruction，那么我们输出的这个rowID的集合就会导致大量的随机访问，从而降低性能。
+
+![20220610154020](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610154020.png)
+
+总共的开销就是这些。
+
+Concurrent Index Access：
+
+这里他给出的是最差的情况。原文中说虽然并发的访问会有缓存的共享，但是在最差的情况下就假设他们都没有成功共享。所以总的cost就是q乘上单个访问的开销。（我感觉不太合理，因为共享肯定是存在的）
+
+![20220610154945](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610154945.png)
+
+![20220610155120](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610155120.png)
+
+![20220610155103](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610155103.png)
+
+## Evaluating Access Path Selection
+
