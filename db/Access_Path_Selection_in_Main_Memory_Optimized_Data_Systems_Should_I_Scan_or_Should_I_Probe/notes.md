@@ -220,4 +220,16 @@ Concurrent Index Access：
 
 ![20220610174023](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610174023.png)
 
-这个图还是值得看一下的。在figure8中，很有意思的是即便是一个查询，在大数据量低选择率的情况下，全表扫描也是一个更好的选择。这是因为我们会在index scan后进行排序。并且即便是低选择率，在大数据量下也会有很多满足条件的元组。我们基于rowID排序进一步加剧了这个效果，导致index scan的效果不好。
+这个图还是值得看一下的。在figure8中，很有意思的是即便是一个查询，在大数据量低选择率的情况下，全表扫描也是一个更好的选择。这是因为我们会在index scan后进行排序。并且即便是低选择率，在大数据量下也会有很多满足条件的元组。我们基于rowID排序进一步加剧了这个效果，导致index scan的效果不好。(这个结论感觉就怪怪的，感觉应该还是更大的数据量上去做index scan效果更好)
+
+然后看一下最后我感觉比较有用的lesson：
+1. Data set size can be pivotal. For small data sets scanning the data outperforms secondary indexes in all cases. Index remains useful for larger data sets as full attribute scans become costly.
+2. While the corssover between access methods is lower than in the past, it still corresponds to a growing result carinality. e.g. a query that selects 0.6% of 500 million integers, has 3 million qualifying tuples.
+3. While sharing data access minimizes repetitive reads, it includes the overhead to distribute the results to their consumers. Result sharing is efficient up to a batch size, because of the bookkeeping and the result distributing overhead.
+4. As the cache and memory latency decreases, or the memory bandwidth decreases, secondary indexes becomre more beneficial. On the contrary, slower caches or memory, and faster memory buses benefit scan. In this way, future hardware generations that affect the balance between these hardware properties will also affect path selection accordingly. These properties are captured by the APS model.
+
+可以看到他这里也说了大数据量下index scan的效果更好。同时大数据量下也会导致更多的结果。
+
+![20220610175854](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610175854.png)
+
+但是这个crossover point会逐渐下降。因为虽然索引扫描复杂度是log的，但是排序的复杂度是nlogn的。这样的话当结果集增大的时候，排序开销会变的不可忽视。
