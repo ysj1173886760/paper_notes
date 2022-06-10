@@ -183,3 +183,41 @@ Concurrent Index Access：
 
 ## Evaluating Access Path Selection
 
+![20220610164915](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610164915.png)
+
+通过这个公式来的到APS，然后用APS和1对比从而确定我们是选择Index Scan还是Shared Scan
+
+![20220610165113](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610165113.png)
+
+我们将这个公式展开并化成有关runtime workload的函数，即对q和Stot的函数
+
+![20220610165233](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610165233.png)
+
+我们研究一下这个公式。
+
+公式中第一部分考虑到了q，数据量N，fanout b，以及hardware tradeoff，这里说的是BWs和Cm与Ca的项。
+
+第二部分则主要由predicate evaluation cost，选择率Stot以及data layout所影响
+
+第一部分中，分子主要由q所决定。由于那个log项的存在，在并发程度提高的时候，这个项提高的程度会很小。
+
+在后面的乘积中，第一项是我们可以在Cache miss的时间中读到的数据量。（可以这么考虑，cache miss越严重，这个项越大，我们就应该多使用sequential scan）。第二项则主要是有b个L1访问的时间中，我们可以读到的数据量。第三项是在我们进行b个比较的时候所能读到的数据量。这后面两项完全对应了树节点访问数据的开销。即我们在访问树节点的时间中，能够顺序扫描的数据量越大，则越应该使用顺序扫描。
+
+可以看到他是通过时间和BWs去tradeoff我们是否应该做顺序扫描。
+
+第二部分则主要由Stot所决定。BWs * Cm / b说的是我们在一次cache miss的时候大概可以顺序读多少个index node。而后面的项则主要取决于data layout。
+
+在分母中，我们有项ts，说明更大的tuple size可以带来更加有用的index scan。因为低选择率的情况，更大的tuple size说明我们可以读到更少的数据。同时分母还引入了predicate evaluation cost，越大则会让顺序扫描开销越大，因为我们需要在每个tuple上都去评估谓词。其中max的含义表示的取移动一个tuple，或者评估谓词时间中所能读到的数据的最大值。评估越慢读到的数据越多，index的效果就越好。
+
+对于q比较小的情况下，我们可以通过Stot来选择是否进行full scan或者index scan。对于q比较大的情况下，第一项则会成为主导。这时候分母中的谓词评估时间也会成为主导。
+
+后面有一些observation可以看一下:
+1. In a modern main-memory optimized analytic data system there is a break-even point regarding the performance of a scan and a shared index scan; access path selection is needed to maximize performance in all scenarios
+2. Unlike traditional query optimization decisions, choosing between a sequential scan and an index scan in a modern system depends on concurrency in addition to selectivity.
+3. In hybrid systems supporting column-groups, secondary indexes are useful in more cases than plain column-stores because using a secodary index helps to avoid moving a larger amount of unnecessary data through the memory hierarchy.
+4. Although hardware characteristics change the point where a sequential scan is preferred over a secondary index scan, all systems require run time analysis to make the decision.
+5. Access path selection becomres more crucial for bigger data inputs as data movement becomres more expensive - and as a result every wrong decision has a larger cost.
+
+![20220610174023](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220610174023.png)
+
+这个图还是值得看一下的。在figure8中，很有意思的是即便是一个查询，在大数据量低选择率的情况下，全表扫描也是一个更好的选择。这是因为我们会在index scan后进行排序。并且即便是低选择率，在大数据量下也会有很多满足条件的元组。我们基于rowID排序进一步加剧了这个效果，导致index scan的效果不好。
