@@ -25,3 +25,76 @@ Postgres的SSI实现必须要和现有的特性结合，而不能像research pro
 在[这篇paper](https://www.cs.umb.edu/~poneil/ROAnom.pdf)中作者说出了他的本质原因。`The fact that SI allows commit order different than serial order is what causes the anomaly`
 
 在上面的例子中，serial order为 T2 < T3，然而由于t3提前提交，导致后来的txn看到了t3，却没看到t2。虽然看到了所有事务的更改，并且没有看到intermediate result，但是仍然发生了异常。
+
+要注意的是，这些anomaly的直接表现都是违背了冲突可串行化的标准。但是他们的成因却有所不同。比如write skew是因为基于过期假设做了决策。而这个由read only txn所导致的异常是因为提交顺序和执行顺序不同，从而导致了读事务读到的状态和可串行化顺序的状态不同。（或者说叫解释的角度不同，冲突可串行化在page model解释事务。而write skew等则是在高层次语义角度解释异常）
+
+有很多的技术是用来避免anomalies：
+* 有些workload不会出现异常，比如tpcc在si下也没有问题
+* explicit locking。比如`LOCK TABLE`可以锁住整个table，`SELECT FOR UPDATE`会在元组上上锁
+* materialized the conflict。比如有的冲突可以通过在dummy row上来将冲突显式表示。比如write skew的时候，我们可以固定更新某个特定的row，从而保证这些txn的可串行化。
+* integrity constraint。由DBMS保证，和隔离级别无关
+
+# Serializable Snapshot Isolation
+
+SSI会让txn运行在snapshot isolation中，但是额外增加了一些检查来避免异常。
+
+SSI的一个特性就是他不会有blocking，那些可能导致违反可串行化的事务会被abort。所以可以提供更好的性能。（有点OCC的感觉）
+
+## Snapshot Isolation Anomalies
+
+![20220709150844](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220709150844.png)
+
+Example1说的是write skew，两个事物都修改了对方读的结果。所以都对对方有rw-conflict。rw-conflict说的是，如果A读了一个t1版本，然后B写了这个tuple，为t2版本，那么A应该排在B前面，因为A没有读到B的t2版本。
+
+而Example2说的就是read only txn引起的问题。2应该在3前面，而1应该在2前面。因为3修改了counter，而2修改了reciept。但是由于T1读到了T3修改的counter，所以出现了问题。
+
+这个其实就是冲突可串行化的依赖图。只不过说的是object level，而非tuple level，目的是包含谓词读。
+
+## Serializability Theory
+
+在wr依赖中，如果A到B有wr依赖，那么A一定在B之前提交了。这样B的snapshot里才会有A。而ww也是一样的道理。A一定在B之前提交了。
+
+对于rw来说，他发生于并发的事务。因为一定是一个事务活跃的时候，另一个事务开始了，所以读事务看不到写事务的结果，从而要求读事务排序在写事务之前。
+
+有研究发现在SI中的anomaly，至少存在着两个rw-antidependency edge。并且这两个edge一定是邻接的。
+
+![20220709154246](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220709154246.png)
+
+![20220709154332](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220709154332.png)
+
+（TODO：感觉这里还需要深入理解一下。rw依赖是因为在SI中并发的事务无法看到对方的修改，从而隐式的确定的了一个顺序。至于为什么T3要最早提交，我感觉是因为如果T3没有提交的话，T3无法构成和T1的WR或者WW依赖。从而组不出环。）
+
+## SSI
+
+SSI的思路类似serialization graph testing的并发控制方法（他会在运行的时候检测是否出现环，从而保证可串行化。个人猜测应该是一个读或者一个写就是一个object。每次新的object都要和现有的object做判断，如果有交集就连边，然后判断是否有环。）
+
+不同的是他检查的是dangerous structure，即两个相邻的rw-antidependency edges。如果某一个txn有一个rw入边和一个rw出边，那么SSI就会abort掉其中一个txn。好处就是SSI不需要去检查wr以及ww。从而可以提高性能。
+
+在S2PL中，以及OCC中，他们不会允许rw的产生。假设我们拆掉了之前例子中的只读事务T1，在OCC中，是不允许提交的。因为T2的读集被修改了。而在S2PL中，读会阻塞写者。所以T3会在T2完成后才能修改。而在SSI中，这是被允许的。并且没有异常会出现。从而允许了更高的并发度。
+
+SSI的论文中。要求我们在读的时候在元组上加上SIREAD的锁。他不会阻塞并发的写入。而是会检测在SIREAD上的写所引起的rw-antidependency。并且这个SIREAD在txn提交后还应该存在。比如write skew的情况下。我们在读的集合上加上SIREAD，然后T1写入x，T2也加上SIREAD，然后T1提交了，这时候会有T2 -> T1，T2这时候写入y的话，会检测到T1 -> T2，那么T2应该abort。如果释放掉SIREAD的话，在T2写入y的时候就会检测不到冲突。
+
+上面的推论2中说明了SIREAD必须要在所有并发的事务都结束后才能释放。
+
+### Variants on SSI
+
+在理论1中，说两个邻接的rw边，并且T3的提交时间要大于T1。如果我们可以保证T1或者T2先提交。那么就可以避免某些false positive的情况（即有相邻rw边，但是提交顺序不满足的时候）。Postgres使用了这个优化。然而他并不能清除掉所有的false positive。因为我们还需要保证有环。比如在上面的例子中，如果只读事务不读batch number，那么T3到T1不会有wr依赖。从而可以达到可串行化的执行顺序。
+
+# Read Only Optimizations
+
+## Theory
+
+![20220709170312](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220709170312.png)
+
+证明这里就不说了。但是可以通过这个理论来减少read only txn的false positive的情况。即当T1是一个read only txn的时候，只有在t3在t1获取他的snapshot之前提交，才可能出现问题。即T1一定要能读到T3的snapshot。
+
+# Safe Snapshots
+
+这个说的就是snapshot可能会出现问题，比如上面那个read only的txn生成的snapshot可能读到的是不对的数据。所以Postgres会跟踪生成snapshot时候的并发的事务。最开始他和普通的事务是一样的，要加SIREAD锁，当并发的事务都提交了以后，这时候的snapshot就可以不用再加SIREAD锁
+
+# Deferrable Transactions
+
+说的是长时间运行的可能被abort，并且加SIREAD也会导致很大的开销。所以他会等待其他的并发事务运行完毕后，再开始运行，从而避免加SIREAD锁。
+
+# Implementing SSI in PostgreSQL
+
