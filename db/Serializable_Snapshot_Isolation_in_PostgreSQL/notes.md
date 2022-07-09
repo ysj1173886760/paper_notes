@@ -98,3 +98,20 @@ SSI的论文中。要求我们在读的时候在元组上加上SIREAD的锁。�
 
 # Implementing SSI in PostgreSQL
 
+## PostgreSQL Background
+
+之前的Postgres提供两种，SI和RC，其中RC每次query都会获取一个最新的snapshot。而SI只有一次。
+
+## Detecting Conflicts
+
+对于rw-conflict，这里有两种情况。分别是先写再读，以及先读再写。注意rw说的是读事务要排序在写事务之前，而非真正的发生在他之前。比如在写事务提交之前，读事务读到了一个之前的版本，这时候就会出现rw-conflict。在postgres现有的实现中，通过xmin和xmax来确定tuple的可见性。当一个读者在遍历tuple的时候，发现xmin是一个活跃的事务。或者他读到的xmax也是一个活跃的事务。说明出现了rw-conflict。这时候读者就必须在写者之前提交。
+
+而对于读者先的情况，Postgres构建了单独的SIREAD锁表。用来添加SIREAD lock，以及检查冲突。这样就可以检测到所有的rw-conflict。
+
+### Implementation of the SSI Lock Manager
+
+读操作会在tuple上SIREAD lock。而对于索引读，则会在B+Tree的页级别来上锁。
+
+虽然使用了多级粒度的锁（page， tuple， table），但是意图锁是没必要的。我们可以按顺序检查各个级别的锁。从而防止并发的锁更新的问题。（这个目前我也不太清楚，我个人感觉意图锁和多粒度的锁的目的是一样的）
+
+SSI lock mananger需要额外处理的东西就是当有DDL来的时候，lock manager中那些通过物理位置定位的锁会失效。比如锁住的是某个tuple id。当DDL修改table之后，tuple会移动位置。所以这时候我们会将SIREAD转移到表级别。同样在索引失效的时候，索引上的锁也会转移到表级别。这些问题在S2PL的LockManager中不会有问题，因为read lock会阻塞DDL（intention lock）
