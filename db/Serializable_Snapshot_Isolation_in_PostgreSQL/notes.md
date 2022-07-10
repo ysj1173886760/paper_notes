@@ -74,7 +74,7 @@ SSI的思路类似serialization graph testing的并发控制方法（他会在�
 
 SSI的论文中。要求我们在读的时候在元组上加上SIREAD的锁。他不会阻塞并发的写入。而是会检测在SIREAD上的写所引起的rw-antidependency。并且这个SIREAD在txn提交后还应该存在。比如write skew的情况下。我们在读的集合上加上SIREAD，然后T1写入x，T2也加上SIREAD，然后T1提交了，这时候会有T2 -> T1，T2这时候写入y的话，会检测到T1 -> T2，那么T2应该abort。如果释放掉SIREAD的话，在T2写入y的时候就会检测不到冲突。
 
-上面的推论2中说明了SIREAD必须要在所有并发的事务都结束后才能释放。
+上面的推论2中说明了SIREAD必须要在所有并发的事务都结束后才能释放。（怎么实现呢？维护high watermark？）
 
 ### Variants on SSI
 
@@ -115,3 +115,36 @@ SSI的论文中。要求我们在读的时候在元组上加上SIREAD的锁。�
 虽然使用了多级粒度的锁（page， tuple， table），但是意图锁是没必要的。我们可以按顺序检查各个级别的锁。从而防止并发的锁更新的问题。（这个目前我也不太清楚，我个人感觉意图锁和多粒度的锁的目的是一样的）
 
 SSI lock mananger需要额外处理的东西就是当有DDL来的时候，lock manager中那些通过物理位置定位的锁会失效。比如锁住的是某个tuple id。当DDL修改table之后，tuple会移动位置。所以这时候我们会将SIREAD转移到表级别。同样在索引失效的时候，索引上的锁也会转移到表级别。这些问题在S2PL的LockManager中不会有问题，因为read lock会阻塞DDL（intention lock）
+
+## Tracking Conflicts
+
+我们的核心目的是跟踪连续的rw边。不同的实现有不同的方法。原始的SSI说每个transaction可以维护两个bit，代表是否有入边，以及是否有出边。
+
+Postgres的选择是跟踪所有的rw边。因为Postgres希望实现上面提到的commit ordering优化。即只有T3提交时间比T1和T2早才可能出现问题。所以我们不能简单的记录一个bit。而是需要记录具体的txn id，从而知道txn的提交时间。并且当有一个txn abort的时候，我们还可以去除掉这些rw边。
+
+Postgres提到他们没有选择跟踪wr和ww关系的一个原因是这些依赖可能存在于外部。
+
+比如上面Example2中的例子。如果T1会划分为两个txn。一个读batch number，一个根据读到的x去读reciept。
+
+这时候依赖图会变成这样
+
+![20220710112131](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220710112131.png)
+
+其中T1.1到T1.2的依赖会变成因果依赖。这是数据库系统跟踪不到的。
+
+## Resolving Conflicts: Safe Retry
+
+当发现了危险的结构的时候，我们希望要abort掉的txn具有某些性质：
+
+![20220710112420](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220710112420.png)
+
+这里有三条规则
+1. T3 commit之前不要abort事务。因为我们要使用commit ordering optimization
+2. 总是尝试abort T2。因为T3已经提交了。当T2 retry的时候，他一定不会和T3并发，构成rw依赖。所以不会出现相同的结构。
+3. 假如T2已经提交了。那么就abort T1。这样也是安全的。因为T1不会再和T2，T3并发。
+
+（说白了就是T1和T2都存在的时候不要abort T1）
+
+由于我们没有在出现危险结构的时候立刻abort txn。所以我们也需要在txn尝试提交的时候去检查一下。比如T3在提交的时候会发现这个结构。那么他会尝试abort掉T2,来让自己提交。
+
+结合上面的理论我们可以猜测一下他的实现方案。由于只有T3是第一个提交的事务的时候才会构成问题。那么当T3提交的时候，我们可以检查T3所有的入边。对于起点的txn，如果他提交了，那么不会构成危险结构。忽略即可。对于未提交的txn，则需要再次遍历他的入边。只有找到了T1和T2都未提交的情况下，我们才需要abort掉链上的T2。
