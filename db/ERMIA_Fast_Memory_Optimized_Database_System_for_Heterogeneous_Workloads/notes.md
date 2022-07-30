@@ -94,7 +94,10 @@ ERMIA通过3种状态的Epoch来减少这种问题。当一个新的Epoch开始�
 
 pstamp就是读到的时间。对于写集中的元素，我们为了避免RW-conflict，就要保证提交时间在pstamp之后。
 
-而sstamp则是版本失效的时间。我们计算出版本最早的失效时间。那么就需要保证pstamp < commit stamp < sstamp
+而sstamp应该是serial stamp的意思，代表了真正的串行顺序。即如果txn读到了某个版本，那么这个txn的ts就一定要小于这个版本的sstamp，否则就会导致读集被改变。
 
-（感觉和tictoc的思路完全相同，只不过tictoc会移动这里的commit ts，而非去验证他在这个范围内）
+所以最终计算出来t.sstamp才是真正的serial stamp。然后验证他要大于pstamp，保证不会影响其他人的读。
 
+这样的话其实CommitTs并不能保证是按照serial order来的。
+
+（感觉和tictoc的思路很类似，只不过tictoc会移动这里的commit ts，而非去验证他在这个范围内）
