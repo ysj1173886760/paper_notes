@@ -154,3 +154,48 @@ SMO的时候先捞起page。再X lock住整个tree。
 >  as long as the key is in the uncommitted deleted state, we need to leave behind a strong lock on a still-existing key for other transactions to trip on and realize that there is an uncommitted delete.
 >
 > The inserted key itself serves as the trpping point, whereas for delete the tripping point has to be another key which must be guaranteed to be a stable one.
+
+## Recovery
+
+这一节提到了ARIES/IM的恢复。其实和原本的ARIES没有什么区别。
+
+SMO不能被undo，所以写入结束后会写一个dummy CLR来跳过对SMO的undo
+
+这里比较关键的是说了一下上面的插入删除的算法里面一些步骤的理由。比如为什么删除操作需要一个Delete Bit。
+
+这里提出了一个概念叫`a point of structural consistency`(POSC)，代表的是树的结构是一致的。
+
+在进行SMO的过程中会破坏掉树的结构。
+
+![](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220924175429.png)
+
+这里应该是在非叶节点没有用到BlinkTree的技术。执行的顺序是T3进行SMO，将P3的指针从P1移动到P2.然后T1删除了P6中的一个元素，T2在P6中插入了一个元素，然后Commit了。这个时候宕机了。那么恢复的时候我们就需要先把T1回滚掉，即把数据从P6中插回来，然后再回滚这个SMO。
+
+但是问题在于，P6可能已经满了插入不进去了，导致我们这次回滚需要做逻辑Undo。但是由于SMO没有被回滚，导致我们没办法从root重新下降。（如果是blink tree 就可以，而且ARIES/IM用的就是类似blink tree，所以感觉是没啥问题的）
+
+解决问题的办法就是在这种可能需要逻辑回滚的情况下，保证树的一致性，也就是POSC
+
+ARIES/IM中列出了这些情况：
+
+If an operation performed originally at time t1 needs to be undone at time t2, then during such an undo, tree traversal is performed only if page-oriented undo cannot be performed due to
+
+1. lack of enough free space on the original page to undo a key delete, thereby necessitating a page split SMO
+2. the key definitely does not belong on the original page anymore: in the undo of a key insert case, the key is not on the page anymore (caused by interleaving page split SMO)
+3. it is ambigious whether the key belongs on the original page or not: undo of a key delete case - the original page is still a leaf page but the key to be put back is not bound on the page
+4. the undo causes the original page to become empty, thereby necessitating a page delete SMO: undo of a key insert case - since at the time of the original insert there must have been at least one other key on the page. it means that there must have been a delete of a boundary key in the time between t1 and t2
+
+翻译一下，undo的时候做插入导致SMO，由于中间的SMO操作导致key不在这个page上了，或者undo的时候做删除导致需要SMO
+
+所以要undo就必须做逻辑undo（其实第四点我感觉可以先删除，再做SMO，但是这个SMO可能作用于一个不一致的树上，所以不行）
+
+那么为了保证做逻辑undo时树的一致性，我们在执行上述操作的时候必须保证POSC
+
+第一点就是通过delete bit来保证的。如果有其他的插入请求遇到的并发的删除请求的话，他就会先要求POSC，来保证后续对于delete的undo会看到一个一致的树。
+
+第二点则不会有任何问题，因为这个SMO一定被回滚了，或者完成了。所以我们看到的一定是一个一致的树，只不过由于SMO导致page-oriented log失效了而已。
+
+第三点，我们需要保证在修改boundary key的时候要满足POSC。所以在删除操作发现要修改boundary key的时候，要获取SMO lock保证POSC
+
+第四点也不会有任何问题，因为如果这里undo需要触发SMO，中途一定出现了boundary key deletion。所以在t1到t2之间一定有POSC。
+
+这里还有一些assertion我还没搞懂，还得再理解理解
