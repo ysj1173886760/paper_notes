@@ -198,4 +198,4 @@ If an operation performed originally at time t1 needs to be undone at time t2, t
 
 第四点也不会有任何问题，因为如果这里undo需要触发SMO，中途一定出现了boundary key deletion。所以在t1到t2之间一定有POSC。
 
-这里还有一些assertion我还没搞懂，还得再理解理解
+而对于算法中的SMO bit来说，是为了防止在SMO结束之前有人操作的SMO相关的page。由于SMO不是原子的，所以后续的Undo就会很难做。所以我个人感觉是为了简化undo。否则如果SMO是原子的话（MTR），那么上面的逻辑都可以省略掉，因为任何时刻树都是一致的。
